@@ -142,3 +142,26 @@ jobs:
 
             ---
             *Windows and Linux support coming soon!*
+
+  # Update Homebrew tap after release is created
+  update-homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trigger Homebrew tap update
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: getfinn/homebrew-tap
+          event-type: release-published
+          client-payload: '{"version": "${{ steps.version.outputs.version }}"}'
