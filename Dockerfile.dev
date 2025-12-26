@@ -1,0 +1,27 @@
+# Development Dockerfile for Desktop Daemon
+# Includes hot-reload with Air
+
+FROM golang:1.23-alpine AS base
+
+# Install Air for hot-reload
+RUN go install github.com/air-verse/air@v1.61.1
+
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod go.sum* ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary
+RUN go build -o /app/finn ./cmd/finn
+
+# Expose port (if daemon has HTTP endpoints)
+EXPOSE 8081
+
+# Run with Air for hot-reload
+CMD ["air", "-c", ".air.toml"]

@@ -1,0 +1,33 @@
+# Binaries (root level only)
+/finn
+/finn-*
+/pocketvibe
+/pocketvibe-*
+*.exe
+
+# Build directories
+/bin/
+/tmp/
+/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+*.log
+
+# Test artifacts
+coverage.out
+coverage.html
+
+# Air hot-reload
+tmp/
