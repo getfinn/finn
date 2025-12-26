@@ -27,10 +27,10 @@ jobs:
             runner: macos-14
             output: finn-macos-arm64
             cgo: '1'
-          # macOS Intel - runs on Intel hardware
+          # macOS Intel - runs on Intel hardware (macos-15-large is Intel x86_64)
           - os: darwin
             arch: amd64
-            runner: macos-13
+            runner: macos-15-large
             output: finn-macos-intel
             cgo: '1'
           # TODO: Windows/Linux need platform-specific syscall fixes
