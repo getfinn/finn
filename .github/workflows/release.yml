@@ -33,18 +33,17 @@ jobs:
             runner: macos-13
             output: finn-macos-intel
             cgo: '1'
-          # Windows - no CGO (headless mode works, no native dialogs)
-          - os: windows
-            arch: amd64
-            runner: windows-latest
-            output: finn-windows.exe
-            cgo: '0'
-          # Linux - no CGO (headless mode works, no native dialogs)
-          - os: linux
-            arch: amd64
-            runner: ubuntu-latest
-            output: finn-linux
-            cgo: '0'
+          # TODO: Windows/Linux need platform-specific syscall fixes
+          # - os: windows
+          #   arch: amd64
+          #   runner: windows-latest
+          #   output: finn-windows.exe
+          #   cgo: '0'
+          # - os: linux
+          #   arch: amd64
+          #   runner: ubuntu-latest
+          #   output: finn-linux
+          #   cgo: '0'
 
     steps:
       - name: Checkout code
@@ -117,8 +116,6 @@ jobs:
           files: |
             binaries/finn-macos-arm64/finn-macos-arm64
             binaries/finn-macos-intel/finn-macos-intel
-            binaries/finn-windows.exe/finn-windows.exe
-            binaries/finn-linux/finn-linux
           body: |
             ## Finn Desktop ${{ steps.version.outputs.version }}
 
@@ -126,31 +123,22 @@ jobs:
 
             | Platform | Download |
             |----------|----------|
-            | macOS (Apple Silicon) | `finn-macos-arm64` |
+            | macOS (Apple Silicon M1/M2/M3) | `finn-macos-arm64` |
             | macOS (Intel) | `finn-macos-intel` |
-            | Windows | `finn-windows.exe` |
-            | Linux | `finn-linux` |
 
-            ### Quick Install (macOS/Linux)
+            ### Quick Install
             ```bash
             curl -fsSL tryfinn.ai/install | sh
             ```
 
-            ### Installation
+            ### Manual Installation
 
-            **macOS:**
-            1. Download `finn-macos-arm64` (Apple Silicon) or `finn-macos-intel`
+            1. Download the binary for your Mac
             2. Open Terminal and run: `chmod +x ~/Downloads/finn-macos-*`
             3. Right-click the file → Open (to bypass Gatekeeper)
             4. Or run from Terminal: `~/Downloads/finn-macos-arm64`
 
-            **Windows:**
-            1. Download `finn-windows.exe`
-            2. Double-click to run
-            3. If SmartScreen blocks it: Click "More info" → "Run anyway"
-
-            **Linux:**
-            1. Download `finn-linux`
-            2. Run: `chmod +x finn-linux && ./finn-linux`
-
             See [tryfinn.ai/download](https://tryfinn.ai/download) for detailed instructions.
+
+            ---
+            *Windows and Linux support coming soon!*
