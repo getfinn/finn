@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+            output: finn-macos-arm64
+          - os: darwin
+            arch: amd64
+            runner: macos-latest
+            output: finn-macos-intel
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            output: finn-windows.exe
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+            output: finn-linux
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
+
+          # Build with version info embedded
+          go build \
+            -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
+            -o ${{ matrix.output }} \
+            cmd/finn/main.go
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: ${{ matrix.output }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: binaries
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Finn Desktop ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-beta') || contains(steps.version.outputs.version, '-alpha') }}
+          generate_release_notes: true
+          files: |
+            binaries/finn-macos-arm64/finn-macos-arm64
+            binaries/finn-macos-intel/finn-macos-intel
+            binaries/finn-windows.exe/finn-windows.exe
+            binaries/finn-linux/finn-linux
+          body: |
+            ## Finn Desktop ${{ steps.version.outputs.version }}
+
+            Download the appropriate binary for your platform:
+
+            | Platform | Download |
+            |----------|----------|
+            | macOS (Apple Silicon) | `finn-macos-arm64` |
+            | macOS (Intel) | `finn-macos-intel` |
+            | Windows | `finn-windows.exe` |
+            | Linux | `finn-linux` |
+
+            ### Quick Install (macOS/Linux)
+            ```bash
+            curl -fsSL tryfinn.ai/install | sh
+            ```
+
+            ### Installation
+
+            **macOS:**
+            1. Download `finn-macos-arm64` (Apple Silicon) or `finn-macos-intel`
+            2. Open Terminal and run: `chmod +x ~/Downloads/finn-macos-*`
+            3. Right-click the file → Open (to bypass Gatekeeper)
+            4. Or run from Terminal: `~/Downloads/finn-macos-arm64`
+
+            **Windows:**
+            1. Download `finn-windows.exe`
+            2. Double-click to run
+            3. If SmartScreen blocks it: Click "More info" → "Run anyway"
+
+            **Linux:**
+            1. Download `finn-linux`
+            2. Run: `chmod +x finn-linux && ./finn-linux`
+
+            See [tryfinn.ai/download](https://tryfinn.ai/download) for detailed instructions.
