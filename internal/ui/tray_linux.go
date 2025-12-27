@@ -11,7 +11,6 @@ import (
 // TrayUI manages the system tray UI (stub for Linux/WSL)
 type TrayUI struct {
 	cfg            *config.Config
-	isConnected    bool
 	onFolderAdd    func(path string)
 	onFolderRemove func(path string)
 	onQuit         func()
@@ -20,8 +19,7 @@ type TrayUI struct {
 // NewTrayUI creates a new system tray UI (stub for Linux/WSL)
 func NewTrayUI(cfg *config.Config) *TrayUI {
 	return &TrayUI{
-		cfg:         cfg,
-		isConnected: false,
+		cfg: cfg,
 	}
 }
 
@@ -36,12 +34,6 @@ func (t *TrayUI) SetCallbacks(onFolderAdd, onFolderRemove func(string), onQuit f
 func (t *TrayUI) Start() {
 	log.Println("System tray not available on Linux/WSL - running in headless mode")
 	// This should never be called when headless=true, but if it is, just return
-}
-
-// UpdateConnectionStatus updates the connection status in the tray (no-op on Linux/WSL)
-func (t *TrayUI) UpdateConnectionStatus(connected bool) {
-	t.isConnected = connected
-	// No GUI to update on Linux/WSL
 }
 
 // ShowNotification shows a system notification (no-op on Linux/WSL)

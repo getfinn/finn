@@ -142,10 +142,6 @@ func (a *Agent) Start() error {
 		a.wsClient.ConnectWithRetry()
 
 		if a.wsClient.IsConnected() {
-			if a.tray != nil {
-				a.tray.UpdateConnectionStatus(true)
-			}
-
 			// Wait for connection to stabilize before sending folder list
 			time.Sleep(100 * time.Millisecond)
 			a.sendFolderListUpdate()

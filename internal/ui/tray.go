@@ -23,8 +23,6 @@ var iconData []byte
 // TrayUI manages the system tray UI
 type TrayUI struct {
 	cfg            *config.Config
-	isConnected    bool
-	statusItem     *systray.MenuItem
 	foldersMenu    *systray.MenuItem
 	onFolderAdd    func(path string)
 	onFolderRemove func(path string)
@@ -34,8 +32,7 @@ type TrayUI struct {
 // NewTrayUI creates a new system tray UI
 func NewTrayUI(cfg *config.Config) *TrayUI {
 	return &TrayUI{
-		cfg:         cfg,
-		isConnected: false,
+		cfg: cfg,
 	}
 }
 
@@ -66,12 +63,6 @@ func (t *TrayUI) onReady() {
 	systray.SetTooltip("Finn - Voice-driven coding assistant")
 
 	log.Println("✅ System tray ready - check your menu bar!")
-
-	// Status item (disabled, just for display)
-	t.statusItem = systray.AddMenuItem("Status: Connecting...", "Connection status")
-	t.statusItem.Disable()
-
-	systray.AddSeparator()
 
 	// Dashboard link (primary action - like Tailscale)
 	dashboardItem := systray.AddMenuItem("Open Dashboard", "Manage folders and view conversations")
@@ -110,19 +101,6 @@ func (t *TrayUI) onReady() {
 // onExit is called when the tray is exiting
 func (t *TrayUI) onExit() {
 	log.Println("System tray exiting")
-}
-
-// UpdateConnectionStatus updates the connection status in the tray
-func (t *TrayUI) UpdateConnectionStatus(connected bool) {
-	t.isConnected = connected
-
-	if t.statusItem != nil {
-		if connected {
-			t.statusItem.SetTitle("🟢 Status: Connected!")
-		} else {
-			t.statusItem.SetTitle("🔴 Status: Offline")
-		}
-	}
 }
 
 // updateFoldersList updates the folders submenu
