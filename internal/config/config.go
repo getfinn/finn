@@ -23,6 +23,7 @@ type Config struct {
 	AuthToken        string                      `json:"auth_token,omitempty"`  // Deprecated: kept for backward compatibility
 	AuthTokens       map[string]string           `json:"auth_tokens,omitempty"` // New: tokens keyed by relay URL
 	RelayURL         string                      `json:"-"`                     // Not saved: determined at runtime from --dev flag or env vars
+	DashboardURL     string                      `json:"-"`                     // Not saved: determined at runtime from --dev flag or env vars
 	ApprovedFolders  []Folder                    `json:"approved_folders"`
 	SelectedFolderID string                      `json:"selected_folder_id"`
 	Subscription     *subscription.Subscription  `json:"subscription"`
@@ -156,10 +157,11 @@ func (c *Config) migrateAuthToken() bool {
 }
 
 // applyEnvironmentOverrides applies environment variable overrides
-// Since relay_url is not saved to disk, we always determine it from flags/env vars
+// Since relay_url and dashboard_url are not saved to disk, we always determine them from flags/env vars
 func (c *Config) applyEnvironmentOverrides(dev bool) {
-	// Always determine relay URL from environment (never use saved value)
+	// Always determine URLs from environment (never use saved values)
 	c.RelayURL = getDefaultRelayURL(dev)
+	c.DashboardURL = getDefaultDashboardURL(dev)
 }
 
 // Save saves the configuration to disk
@@ -182,17 +184,19 @@ func (c *Config) Save() error {
 
 // createDefaultConfig creates a default configuration
 func createDefaultConfig(dev bool) (*Config, error) {
-	// Default relay URL - production by default unless dev flag is set
+	// Default URLs - production by default unless dev flag is set
 	// Priority order:
 	// 1. Dev flag (--dev, uses localhost)
-	// 2. FINN_RELAY_URL env var
+	// 2. FINN_RELAY_URL / FINN_DASHBOARD_URL env vars
 	// 3. RELAY_HOST env var (for easier domain switching)
-	// 4. Hardcoded production IP (fallback)
+	// 4. Hardcoded production URLs (fallback)
 	defaultRelayURL := getDefaultRelayURL(dev)
+	defaultDashboardURL := getDefaultDashboardURL(dev)
 
 	cfg := &Config{
 		DeviceID:        generateDeviceID(),
 		RelayURL:        defaultRelayURL,
+		DashboardURL:    defaultDashboardURL,
 		ApprovedFolders: []Folder{},
 		Subscription:    subscription.NewSubscription(subscription.TierStandard),
 		ExecutionMode: ExecutionMode{
@@ -373,4 +377,20 @@ func getDefaultRelayURL(dev bool) string {
 
 	// 4. Fallback to hardcoded production relay
 	return "wss://api.tryfinn.ai/ws"
+}
+
+// getDefaultDashboardURL returns the default dashboard URL with fallback logic
+func getDefaultDashboardURL(dev bool) string {
+	// 1. Check dev flag first (highest priority for local development)
+	if dev {
+		return "http://localhost:3000"
+	}
+
+	// 2. Check for full URL override
+	if url := os.Getenv("FINN_DASHBOARD_URL"); url != "" {
+		return url
+	}
+
+	// 3. Fallback to hardcoded production dashboard
+	return "https://tryfinn.ai"
 }

@@ -17,16 +17,17 @@ type Subscription struct {
 }
 
 // GetMaxFolders returns the maximum number of folders allowed for a tier
+// Returns -1 for unlimited (Max tier)
 func GetMaxFolders(tier SubscriptionTier) int {
 	switch tier {
 	case TierStandard:
-		return 5
+		return 3 // Free tier: 3 folders
 	case TierPro:
-		return 10
+		return 5 // Pro tier ($10/mo): 5 folders
 	case TierMax:
-		return 20
+		return -1 // Max tier ($25/mo): Unlimited folders
 	default:
-		return 5 // Default to standard
+		return 3 // Default to free tier
 	}
 }
 
@@ -40,9 +41,14 @@ func NewSubscription(tier SubscriptionTier) *Subscription {
 }
 
 // CanAddFolder checks if the user can add another folder
+// Returns true for unlimited (-1) tier
 func (s *Subscription) CanAddFolder(currentFolderCount int) bool {
 	if !s.Active {
 		return false
+	}
+	// -1 means unlimited folders (Max tier)
+	if s.MaxFolders == -1 {
+		return true
 	}
 	return currentFolderCount < s.MaxFolders
 }

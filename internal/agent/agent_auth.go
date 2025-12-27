@@ -3,7 +3,6 @@ package agent
 import (
 	"fmt"
 	"log"
-	"os"
 	"os/exec"
 	"runtime"
 	"time"
@@ -22,13 +21,10 @@ func (a *Agent) authenticateViaOAuth() (string, error) {
 	}
 	defer oauthServer.Stop()
 
-	// Build auth URL - use environment variable or default to localhost for development
-	dashboardURL := os.Getenv("FINN_DASHBOARD_URL")
-	if dashboardURL == "" {
-		dashboardURL = "http://localhost:3000"
-	}
+	// Build auth URL using the dashboard URL from config
+	// (determined by --dev flag or FINN_DASHBOARD_URL env var)
 	authURL := fmt.Sprintf("%s/auth/daemon?port=47923&device_id=%s",
-		dashboardURL, a.cfg.DeviceID)
+		a.cfg.DashboardURL, a.cfg.DeviceID)
 
 	log.Printf("🌐 Opening browser for authentication...")
 	log.Printf("   If browser doesn't open, visit: %s", authURL)
