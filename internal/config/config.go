@@ -14,6 +14,15 @@ import (
 type ExecutionMode struct {
 	InteractiveMode  bool   `json:"interactiveMode"`     // Enable interactive mode with decisions
 	DiffApprovalMode string `json:"diff_approval_mode"` // "show-all", "show-on-error", "auto-approve"
+	LLMProvider      string `json:"llm_provider"`       // "claude" (default) or "gemini"
+}
+
+// GetLLMProvider returns the configured LLM provider, defaulting to "claude" if not set.
+func (e *ExecutionMode) GetLLMProvider() string {
+	if e.LLMProvider == "" || e.LLMProvider == "claude-code" {
+		return "claude" // Default to Claude
+	}
+	return e.LLMProvider
 }
 
 // Config holds the daemon's configuration

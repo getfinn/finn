@@ -412,6 +412,14 @@ func (a *Agent) sendFolderListUpdate() {
 				totalCommits += len(commits)
 				log.Printf("📦 Folder %s: %d commits (branch: %v)", folder.Name, len(commits), folderData["current_branch"])
 			}
+
+			// Get uncommitted files
+			uncommittedFiles, err := repo.DetectChangedFiles()
+			if err == nil && len(uncommittedFiles) > 0 {
+				folderData["uncommitted_count"] = len(uncommittedFiles)
+				folderData["uncommitted_files"] = uncommittedFiles
+				log.Printf("📝 Folder %s: %d uncommitted files", folder.Name, len(uncommittedFiles))
+			}
 		}
 
 		foldersWithCommits = append(foldersWithCommits, folderData)

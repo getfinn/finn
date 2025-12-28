@@ -26,6 +26,7 @@ const (
 	EventTypeDiff     EventType = "diff"
 	EventTypeComplete EventType = "complete"
 	EventTypeError    EventType = "error"
+	EventTypeUsage    EventType = "usage" // Token usage data from LLM
 )
 
 // Event represents an event during task execution.

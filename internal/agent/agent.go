@@ -12,6 +12,7 @@ import (
 	"github.com/getfinn/finn/internal/claude"
 	"github.com/getfinn/finn/internal/config"
 	"github.com/getfinn/finn/internal/devserver"
+	"github.com/getfinn/finn/internal/llm"
 	"github.com/getfinn/finn/internal/tunnel"
 	"github.com/getfinn/finn/internal/ui"
 	"github.com/getfinn/finn/internal/watcher"
@@ -20,8 +21,10 @@ import (
 
 // ConversationState tracks state for an ongoing conversation.
 type ConversationState struct {
-	executor     claude.TaskRunner
-	pendingDiffs map[string]bool // file_path -> approved
+	executor     claude.TaskRunner       // Claude executor (legacy)
+	llmExecutor  llm.InteractiveExecutor // LLM executor (for Gemini, etc.)
+	provider     llm.Provider            // Which LLM provider is being used (for reprompts)
+	pendingDiffs map[string]bool         // file_path -> approved
 	totalDiffs   int
 	folderPath   string   // Track folder path for reprompts
 	folderID     string   // Track folder ID for commit tracking
@@ -29,7 +32,7 @@ type ConversationState struct {
 }
 
 // Agent is the main daemon agent that orchestrates all operations.
-// It manages WebSocket connections, folder approvals, Claude execution,
+// It manages WebSocket connections, folder approvals, Claude/Gemini execution,
 // git operations, session watching, and live preview tunnels.
 type Agent struct {
 	cfg                *config.Config
@@ -37,9 +40,13 @@ type Agent struct {
 	tray               *ui.TrayUI
 	isRunning          bool
 	headless           bool
-	executors          map[string]claude.TaskRunner  // conversation_id -> executor
+	executors          map[string]claude.TaskRunner  // conversation_id -> Claude executor
 	conversationStates map[string]*ConversationState // conversation_id -> state
 	sessionWatcher     *watcher.Watcher              // Watches ~/.claude/projects for external sessions
+
+	// LLM executors (for Gemini, etc.)
+	llmExecutors            map[string]llm.Executor            // conversation_id -> one-shot LLM executor
+	llmInteractiveExecutors map[string]llm.InteractiveExecutor // conversation_id -> interactive LLM executor
 
 	// Client presence tracking (for skipping broadcasts when no listeners)
 	mobileOnline bool
@@ -66,15 +73,17 @@ func New(headless bool, dev bool) (*Agent, error) {
 	}
 
 	return &Agent{
-		cfg:                cfg,
-		isRunning:          false,
-		headless:           headless,
-		executors:          make(map[string]claude.TaskRunner),
-		conversationStates: make(map[string]*ConversationState),
-		tunnels:            make(map[string]*tunnel.Client),
-		devServers:         devserver.NewManager(),
-		lastKnownHeads:     make(map[string]string),
-		gitSyncStop:        make(chan struct{}),
+		cfg:                     cfg,
+		isRunning:               false,
+		headless:                headless,
+		executors:               make(map[string]claude.TaskRunner),
+		conversationStates:      make(map[string]*ConversationState),
+		tunnels:                 make(map[string]*tunnel.Client),
+		devServers:              devserver.NewManager(),
+		lastKnownHeads:          make(map[string]string),
+		gitSyncStop:             make(chan struct{}),
+		llmExecutors:            make(map[string]llm.Executor),
+		llmInteractiveExecutors: make(map[string]llm.InteractiveExecutor),
 	}, nil
 }
 

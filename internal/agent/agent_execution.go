@@ -7,17 +7,21 @@ import (
 
 	"github.com/getfinn/finn/internal/claude"
 	"github.com/getfinn/finn/internal/git"
+	"github.com/getfinn/finn/internal/llm"
+	_ "github.com/getfinn/finn/internal/llm/providers" // Register all LLM providers
+	"github.com/getfinn/finn/internal/llm/providers/gemini"
 	ws "github.com/getfinn/finn/internal/websocket"
 )
 
 // handlePrompt handles a prompt message from mobile.
-// This starts a new Claude Code task execution.
+// This starts an LLM task execution (Claude or Gemini based on config or message override).
 func (a *Agent) handlePrompt(msg *ws.Message) {
 	var payload struct {
 		ConversationID string `json:"conversation_id"`
 		FolderID       string `json:"folder_id"`
 		Text           string `json:"text"`
-		SessionID      string `json:"session_id,omitempty"` // If provided, resume this session
+		SessionID      string `json:"session_id,omitempty"`    // If provided, resume this session
+		LLMProvider    string `json:"llm_provider,omitempty"` // LLM provider to use: "claude", "gemini", etc.
 	}
 
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -25,7 +29,12 @@ func (a *Agent) handlePrompt(msg *ws.Message) {
 		return
 	}
 
-	log.Printf("📝 Received prompt: %s (folder: %s, session: %s)", payload.Text, payload.FolderID, payload.SessionID)
+	// Use provider from message if specified, otherwise fall back to config default
+	llmProvider := payload.LLMProvider
+	if llmProvider == "" {
+		llmProvider = a.cfg.ExecutionMode.GetLLMProvider()
+	}
+	log.Printf("📝 Received prompt: %s (folder: %s, session: %s, provider: %s)", payload.Text, payload.FolderID, payload.SessionID, llmProvider)
 
 	// Find the approved folder
 	var folderPath string
@@ -42,15 +51,24 @@ func (a *Agent) handlePrompt(msg *ws.Message) {
 		return
 	}
 
-	// Check if Claude Code is installed
-	if !claude.IsInstalled() {
-		log.Println("❌ Claude Code CLI not installed")
-		a.sendError(payload.ConversationID, "Claude Code CLI not installed. Please run: npm install -g @anthropic-ai/claude-code")
-		return
+	// Check if the selected LLM CLI is installed
+	if llmProvider == "gemini" {
+		if !gemini.IsInstalled() {
+			log.Println("❌ Gemini CLI not installed")
+			a.sendError(payload.ConversationID, "Gemini CLI not installed. Please run: npm install -g @google/gemini-cli")
+			return
+		}
+	} else {
+		// Default to Claude
+		if !claude.IsInstalled() {
+			log.Println("❌ Claude Code CLI not installed")
+			a.sendError(payload.ConversationID, "Claude Code CLI not installed. Please run: npm install -g @anthropic-ai/claude-code")
+			return
+		}
 	}
 
-	// Create event handler for both executor types
-	onEvent := func(event claude.Event) {
+	// Create event handlers - one for Claude (uses claude.Event) and one for LLM factory (uses llm.Event)
+	onClaudeEvent := func(event claude.Event) {
 		// Track diff events to manage approval flow
 		if event.Type == claude.EventTypeDiff {
 			state := a.conversationStates[payload.ConversationID]
@@ -58,16 +76,41 @@ func (a *Agent) handlePrompt(msg *ws.Message) {
 				a.trackDiffEvent(state, event)
 			}
 		}
-
 		// Convert Claude events to WebSocket messages and send to mobile
 		a.sendClaudeEvent(payload.ConversationID, event)
 	}
 
-	// Branch between one-shot and interactive modes based on interactiveMode setting
-	if !a.cfg.ExecutionMode.InteractiveMode {
-		a.startOneShotExecution(payload.ConversationID, folderPath, payload.Text, onEvent)
+	onLLMEvent := func(event llm.Event) {
+		// Convert llm.Event to claude.Event for compatibility
+		claudeEvent := claude.Event{
+			Type:    claude.EventType(event.Type),
+			Content: event.Content,
+		}
+		// Track diff events to manage approval flow
+		if event.Type == llm.EventTypeDiff {
+			state := a.conversationStates[payload.ConversationID]
+			if state != nil {
+				a.trackDiffEvent(state, claudeEvent)
+			}
+		}
+		// Send event to mobile
+		a.sendClaudeEvent(payload.ConversationID, claudeEvent)
+	}
+
+	// Branch based on provider and execution mode
+	if llmProvider == "gemini" {
+		if !a.cfg.ExecutionMode.InteractiveMode {
+			a.startGeminiOneShotExecution(payload.ConversationID, folderPath, payload.Text, onLLMEvent)
+		} else {
+			a.startGeminiInteractiveExecution(payload.ConversationID, payload.FolderID, folderPath, payload.Text, payload.SessionID, onLLMEvent)
+		}
 	} else {
-		a.startInteractiveExecution(payload.ConversationID, payload.FolderID, folderPath, payload.Text, payload.SessionID, onEvent)
+		// Default to Claude
+		if !a.cfg.ExecutionMode.InteractiveMode {
+			a.startOneShotExecution(payload.ConversationID, folderPath, payload.Text, onClaudeEvent)
+		} else {
+			a.startInteractiveExecution(payload.ConversationID, payload.FolderID, folderPath, payload.Text, payload.SessionID, onClaudeEvent)
+		}
 	}
 }
 
@@ -107,12 +150,13 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 	// Create conversation state for tracking approvals
 	a.conversationStates[conversationID] = &ConversationState{
 		executor:     interactiveExec,
+		provider:     llm.ProviderClaude,
 		pendingDiffs: make(map[string]bool),
 		totalDiffs:   0,
 		folderPath:   folderPath,
 		folderID:     folderID,
 	}
-	log.Printf("📊 Created conversation state for: %s (folder: %s)", conversationID, folderID)
+	log.Printf("📊 Created conversation state for: %s (folder: %s, provider: claude)", conversationID, folderID)
 
 	if sessionID != "" {
 		// Resume existing session
@@ -132,6 +176,81 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 				log.Printf("❌ Task execution failed: %v", err)
 				a.sendError(conversationID, err.Error())
 				delete(a.executors, conversationID)
+				delete(a.conversationStates, conversationID)
+			}
+		}()
+	}
+}
+
+// startGeminiOneShotExecution starts a one-shot Gemini execution.
+func (a *Agent) startGeminiOneShotExecution(conversationID, folderPath, prompt string, onEvent func(llm.Event)) {
+	log.Println("🚀 [Gemini] Using one-shot mode (auto-approve)")
+
+	executor, err := llm.NewExecutor(llm.ProviderGemini, folderPath, onEvent)
+	if err != nil {
+		log.Printf("❌ [Gemini] Failed to create executor: %v", err)
+		a.sendError(conversationID, fmt.Sprintf("Failed to create Gemini executor: %v", err))
+		return
+	}
+
+	// Store executor (wrapped to satisfy interface)
+	a.llmExecutors[conversationID] = executor
+
+	go func() {
+		if err := executor.ExecuteTask(prompt); err != nil {
+			log.Printf("❌ [Gemini] Task execution failed: %v", err)
+			a.sendError(conversationID, err.Error())
+		}
+		delete(a.llmExecutors, conversationID)
+	}()
+}
+
+// startGeminiInteractiveExecution starts an interactive Gemini execution.
+func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folderPath, prompt, sessionID string, onEvent func(llm.Event)) {
+	log.Println("🤝 [Gemini] Using interactive mode")
+
+	executor, err := llm.NewInteractiveExecutor(llm.ProviderGemini, folderPath, onEvent)
+	if err != nil {
+		log.Printf("❌ [Gemini] Failed to create interactive executor: %v", err)
+		a.sendError(conversationID, fmt.Sprintf("Failed to create Gemini executor: %v", err))
+		return
+	}
+
+	// Set up session linking callback
+	executor.SetSessionLinkedHandler(func(sid string) {
+		a.sendSessionLinked(conversationID, sid, folderID)
+	})
+
+	// Store executor
+	a.llmInteractiveExecutors[conversationID] = executor
+
+	// Create conversation state for tracking approvals
+	a.conversationStates[conversationID] = &ConversationState{
+		llmExecutor:  executor,
+		provider:     llm.ProviderGemini,
+		pendingDiffs: make(map[string]bool),
+		totalDiffs:   0,
+		folderPath:   folderPath,
+		folderID:     folderID,
+	}
+	log.Printf("📊 [Gemini] Created conversation state for: %s (folder: %s, provider: gemini)", conversationID, folderID)
+
+	if sessionID != "" {
+		log.Printf("🔄 [Gemini] Resuming session: %s", sessionID)
+		go func() {
+			if err := executor.ResumeSession(sessionID, prompt); err != nil {
+				log.Printf("❌ [Gemini] Session resume failed: %v", err)
+				a.sendError(conversationID, err.Error())
+				delete(a.llmInteractiveExecutors, conversationID)
+				delete(a.conversationStates, conversationID)
+			}
+		}()
+	} else {
+		go func() {
+			if err := executor.Start(prompt); err != nil {
+				log.Printf("❌ [Gemini] Task execution failed: %v", err)
+				a.sendError(conversationID, err.Error())
+				delete(a.llmInteractiveExecutors, conversationID)
 				delete(a.conversationStates, conversationID)
 			}
 		}()
@@ -190,6 +309,33 @@ func (a *Agent) handleChoice(msg *ws.Message) {
 	log.Printf("✅ User selected: %s for conversation: %s (remember=%v, tool=%s)",
 		payload.SelectedID, payload.ConversationID, payload.Remember, payload.ToolName)
 
+	// Build choice message
+	var choiceMessage string
+	if payload.DecisionType == "plan_approval" {
+		if payload.SelectedID == "approve" {
+			choiceMessage = "Yes, proceed with the plan"
+		} else {
+			choiceMessage = "No, let me suggest some changes"
+		}
+	} else {
+		choiceMessage = fmt.Sprintf("I choose option %s", payload.SelectedID)
+	}
+
+	// Check for LLM interactive executor (Gemini, etc.)
+	if llmExecutor, exists := a.llmInteractiveExecutors[payload.ConversationID]; exists {
+		log.Printf("🔄 Sending choice to LLM interactive executor")
+
+		if err := llmExecutor.SendChoice(choiceMessage); err != nil {
+			log.Printf("❌ Failed to send choice to LLM executor: %v", err)
+			a.sendError(payload.ConversationID, fmt.Sprintf("Failed to send choice: %v", err))
+			return
+		}
+
+		log.Println("✅ Choice sent - waiting for LLM to continue...")
+		return
+	}
+
+	// Check for Claude executor
 	executor, exists := a.executors[payload.ConversationID]
 	if !exists {
 		log.Printf("❌ No active executor for conversation: %s", payload.ConversationID)
@@ -198,18 +344,7 @@ func (a *Agent) handleChoice(msg *ws.Message) {
 	}
 
 	if interactive, ok := executor.(*claude.InteractiveTaskExecutor); ok {
-		log.Printf("🔄 Sending choice to interactive executor")
-
-		var choiceMessage string
-		if payload.DecisionType == "plan_approval" {
-			if payload.SelectedID == "approve" {
-				choiceMessage = "Yes, proceed with the plan"
-			} else {
-				choiceMessage = "No, let me suggest some changes"
-			}
-		} else {
-			choiceMessage = fmt.Sprintf("I choose option %s", payload.SelectedID)
-		}
+		log.Printf("🔄 Sending choice to Claude interactive executor")
 
 		if err := interactive.SendMessage(choiceMessage); err != nil {
 			log.Printf("❌ Failed to send choice: %v", err)
@@ -287,8 +422,10 @@ func (a *Agent) handleApproval(msg *ws.Message) {
 		}
 	}
 
-	// Clean up
+	// Clean up all executor types and conversation state
 	delete(a.executors, payload.ConversationID)
+	delete(a.llmExecutors, payload.ConversationID)
+	delete(a.llmInteractiveExecutors, payload.ConversationID)
 	delete(a.conversationStates, payload.ConversationID)
 	log.Printf("🧹 Cleaned up conversation: %s", payload.ConversationID)
 }
@@ -370,25 +507,62 @@ func (a *Agent) handleReprompt(msg *ws.Message) {
 	state.pendingDiffs = make(map[string]bool)
 	state.totalDiffs = 0
 
-	onEvent := func(event claude.Event) {
-		if event.Type == claude.EventTypeDiff {
-			a.trackDiffEvent(state, event)
+	// Branch based on which provider was used for this conversation
+	if state.provider == llm.ProviderGemini {
+		log.Println("🔄 [Gemini] Creating new executor for reprompt iteration")
+
+		// LLM event handler (for Gemini)
+		onLLMEvent := func(event llm.Event) {
+			// Convert to claude.Event for compatibility
+			claudeEvent := claude.Event{
+				Type:    claude.EventType(event.Type),
+				Content: event.Content,
+			}
+			if event.Type == llm.EventTypeDiff {
+				a.trackDiffEvent(state, claudeEvent)
+			}
+			a.sendClaudeEvent(payload.ConversationID, claudeEvent)
 		}
-		a.sendClaudeEvent(payload.ConversationID, event)
+
+		executor, err := llm.NewInteractiveExecutor(llm.ProviderGemini, state.folderPath, onLLMEvent)
+		if err != nil {
+			log.Printf("❌ [Gemini] Failed to create executor for reprompt: %v", err)
+			a.sendError(payload.ConversationID, fmt.Sprintf("Failed to create Gemini executor: %v", err))
+			return
+		}
+
+		a.llmInteractiveExecutors[payload.ConversationID] = executor
+		state.llmExecutor = executor
+
+		go func() {
+			if err := executor.Start(contextPrompt); err != nil {
+				log.Printf("❌ [Gemini] Reprompt execution failed: %v", err)
+				a.sendError(payload.ConversationID, err.Error())
+			}
+		}()
+	} else {
+		// Default to Claude
+		log.Println("🔄 [Claude] Creating new executor for reprompt iteration")
+
+		onEvent := func(event claude.Event) {
+			if event.Type == claude.EventTypeDiff {
+				a.trackDiffEvent(state, event)
+			}
+			a.sendClaudeEvent(payload.ConversationID, event)
+		}
+
+		executor := claude.NewInteractiveTaskExecutor(state.folderPath, onEvent)
+
+		a.executors[payload.ConversationID] = executor
+		state.executor = executor
+
+		go func() {
+			if err := executor.ExecuteTask(contextPrompt); err != nil {
+				log.Printf("❌ [Claude] Reprompt execution failed: %v", err)
+				a.sendError(payload.ConversationID, err.Error())
+			}
+		}()
 	}
-
-	log.Println("🔄 Creating new executor for reprompt iteration")
-	executor := claude.NewInteractiveTaskExecutor(state.folderPath, onEvent)
-
-	a.executors[payload.ConversationID] = executor
-	state.executor = executor
-
-	go func() {
-		if err := executor.ExecuteTask(contextPrompt); err != nil {
-			log.Printf("❌ Reprompt execution failed: %v", err)
-			a.sendError(payload.ConversationID, err.Error())
-		}
-	}()
 }
 
 // buildRepromptWithContext builds a context-aware prompt with diff context.
@@ -418,6 +592,7 @@ func (a *Agent) handleSettingsUpdate(msg *ws.Message) {
 	var payload struct {
 		InteractiveMode  bool   `json:"interactiveMode"`
 		DiffApprovalMode string `json:"diffApprovalMode"`
+		LLMProvider      string `json:"llm_provider,omitempty"` // Default LLM provider
 	}
 
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -425,11 +600,14 @@ func (a *Agent) handleSettingsUpdate(msg *ws.Message) {
 		return
 	}
 
-	log.Printf("⚙️  Settings update received - InteractiveMode: %v, DiffApprovalMode: %s",
-		payload.InteractiveMode, payload.DiffApprovalMode)
+	log.Printf("⚙️  Settings update received - InteractiveMode: %v, DiffApprovalMode: %s, LLMProvider: %s",
+		payload.InteractiveMode, payload.DiffApprovalMode, payload.LLMProvider)
 
 	a.cfg.ExecutionMode.InteractiveMode = payload.InteractiveMode
 	a.cfg.ExecutionMode.DiffApprovalMode = payload.DiffApprovalMode
+	if payload.LLMProvider != "" {
+		a.cfg.ExecutionMode.LLMProvider = payload.LLMProvider
+	}
 
 	if err := a.cfg.Save(); err != nil {
 		log.Printf("❌ Failed to save settings: %v", err)
