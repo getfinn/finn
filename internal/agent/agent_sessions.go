@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getfinn/finn/internal/claude"
+	"github.com/getfinn/finn/internal/llm/providers/claude"
 	"github.com/getfinn/finn/internal/git"
 	"github.com/getfinn/finn/internal/watcher"
 	ws "github.com/getfinn/finn/internal/websocket"

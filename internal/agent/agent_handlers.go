@@ -54,6 +54,12 @@ func (a *Agent) handleMessage(msg *ws.Message) {
 		a.handleGetCommitDetail(msg)
 	case "request_commit_sync":
 		a.handleRequestCommitSync(msg)
+	case "get_uncommitted_diffs":
+		log.Println("📜 Mobile requested uncommitted diffs")
+		a.handleGetUncommittedDiffs(msg)
+	case "standalone_commit":
+		log.Println("📝 Mobile requested standalone commit")
+		a.handleStandaloneCommit(msg)
 
 	// Session messages
 	case "resume_session":
@@ -123,9 +129,14 @@ func (a *Agent) handlePresenceUpdate(msg *ws.Message) {
 	case "mobile":
 		// Only log if state actually changed (reduces noise during hot reload)
 		if a.mobileOnline != payload.Online {
+			wasOffline := !a.mobileOnline
 			a.mobileOnline = payload.Online
 			if payload.Online {
 				log.Println("📱 Mobile client connected")
+				// If mobile was offline and just reconnected, sync any pending conversations
+				if wasOffline {
+					go a.syncPendingConversationsToMobile()
+				}
 			} else {
 				log.Println("📱 Mobile client disconnected")
 			}

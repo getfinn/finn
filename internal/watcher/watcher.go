@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/getfinn/finn/internal/claude"
+	"github.com/getfinn/finn/internal/llm/providers/claude"
 )
 
 // SessionInfo represents a detected Claude Code session

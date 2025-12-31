@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/getfinn/finn/internal/git"
@@ -513,4 +514,255 @@ func (a *Agent) sendCommitSuccess(conversationID string, folderPath string, fold
 
 	// Also send updated folder list with new commits
 	a.sendFolderListUpdate()
+}
+
+// handleGetUncommittedDiffs handles a request for uncommitted file diffs (standalone, not tied to conversation).
+func (a *Agent) handleGetUncommittedDiffs(msg *ws.Message) {
+	var payload struct {
+		FolderID string `json:"folder_id"`
+	}
+
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Printf("Failed to unmarshal get_uncommitted_diffs payload: %v", err)
+		return
+	}
+
+	log.Printf("📥 Received get_uncommitted_diffs request for folder: %s", payload.FolderID)
+
+	// Find the folder path
+	var folderPath string
+	for _, folder := range a.cfg.ApprovedFolders {
+		if folder.ID == payload.FolderID {
+			folderPath = folder.Path
+			break
+		}
+	}
+
+	if folderPath == "" {
+		log.Printf("❌ Folder not found: %s", payload.FolderID)
+		a.sendUncommittedDiffsError(payload.FolderID, "Folder not found")
+		return
+	}
+
+	if !git.IsGitRepo(folderPath) {
+		log.Printf("❌ Not a git repository: %s", folderPath)
+		a.sendUncommittedDiffsError(payload.FolderID, "Not a git repository")
+		return
+	}
+
+	repo := git.NewRepository(folderPath)
+
+	// Generate diffs for all uncommitted files
+	diffs, err := repo.GenerateAllDiffs()
+	if err != nil {
+		log.Printf("❌ Failed to generate diffs: %v", err)
+		a.sendUncommittedDiffsError(payload.FolderID, fmt.Sprintf("Failed to generate diffs: %v", err))
+		return
+	}
+
+	// Convert to array format for response
+	var filesArray []map[string]interface{}
+	for filePath, diff := range diffs {
+		// Parse additions/deletions from diff
+		additions, deletions := 0, 0
+		for _, line := range strings.Split(diff, "\n") {
+			if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+				additions++
+			} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+				deletions++
+			}
+		}
+
+		filesArray = append(filesArray, map[string]interface{}{
+			"file_path": filePath,
+			"diff":      diff,
+			"additions": additions,
+			"deletions": deletions,
+		})
+	}
+
+	log.Printf("📤 Sending %d uncommitted diffs for folder: %s", len(filesArray), payload.FolderID)
+
+	responsePayload, _ := json.Marshal(map[string]interface{}{
+		"folder_id": payload.FolderID,
+		"files":     filesArray,
+	})
+
+	responseMsg := &ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       "uncommitted_diffs",
+		Payload:    responsePayload,
+	}
+
+	if err := a.wsClient.SendMessage(responseMsg); err != nil {
+		log.Printf("❌ Failed to send uncommitted_diffs: %v", err)
+	}
+}
+
+// sendUncommittedDiffsError sends an error response for uncommitted diffs request.
+func (a *Agent) sendUncommittedDiffsError(folderID string, errMsg string) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"folder_id": folderID,
+		"error":     errMsg,
+		"files":     []map[string]interface{}{},
+	})
+
+	msg := &ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       "uncommitted_diffs",
+		Payload:    payload,
+	}
+
+	if err := a.wsClient.SendMessage(msg); err != nil {
+		log.Printf("❌ Failed to send uncommitted_diffs error: %v", err)
+	}
+}
+
+// handleStandaloneCommit handles a commit request not tied to a conversation.
+func (a *Agent) handleStandaloneCommit(msg *ws.Message) {
+	var payload struct {
+		FolderID      string `json:"folder_id"`
+		CommitMessage string `json:"commit_message"`
+	}
+
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Printf("Failed to unmarshal standalone_commit payload: %v", err)
+		return
+	}
+
+	log.Printf("📥 Received standalone_commit request for folder: %s", payload.FolderID)
+
+	// Find the folder path
+	var folderPath string
+	for _, folder := range a.cfg.ApprovedFolders {
+		if folder.ID == payload.FolderID {
+			folderPath = folder.Path
+			break
+		}
+	}
+
+	if folderPath == "" {
+		log.Printf("❌ Folder not found: %s", payload.FolderID)
+		a.sendStandaloneCommitResponse(payload.FolderID, false, "Folder not found", nil)
+		return
+	}
+
+	if !git.IsGitRepo(folderPath) {
+		log.Printf("❌ Not a git repository: %s", folderPath)
+		a.sendStandaloneCommitResponse(payload.FolderID, false, "Not a git repository", nil)
+		return
+	}
+
+	repo := git.NewRepository(folderPath)
+
+	// Check if there are changes to commit
+	hasChanges, err := repo.HasChanges()
+	if err != nil {
+		log.Printf("❌ Failed to check for changes: %v", err)
+		a.sendStandaloneCommitResponse(payload.FolderID, false, fmt.Sprintf("Failed to check for changes: %v", err), nil)
+		return
+	}
+
+	if !hasChanges {
+		log.Printf("⚠️ No changes to commit in: %s", folderPath)
+		a.sendStandaloneCommitResponse(payload.FolderID, false, "No changes to commit", nil)
+		return
+	}
+
+	// Use provided message or default
+	commitMsg := payload.CommitMessage
+	if commitMsg == "" {
+		commitMsg = "Changes committed via Finn"
+	}
+
+	// First, commit the changes
+	if err := repo.Commit(commitMsg); err != nil {
+		log.Printf("❌ Failed to commit: %v", err)
+		a.sendStandaloneCommitResponse(payload.FolderID, false, fmt.Sprintf("Commit failed: %v", err), nil)
+		return
+	}
+
+	log.Printf("✅ Commit successful in: %s", folderPath)
+
+	// Then, try to push (but don't fail the whole operation if push fails)
+	pushFailed := false
+	pushError := ""
+	if err := repo.Push(); err != nil {
+		// Check if it's a "no remote" error - that's OK
+		errStr := err.Error()
+		if strings.Contains(errStr, "No configured push destination") ||
+			strings.Contains(errStr, "no upstream branch") {
+			log.Printf("ℹ️  No remote repository configured - changes committed locally only")
+		} else {
+			// Real push error - note it but don't fail
+			log.Printf("⚠️ Push failed (commit succeeded): %v", err)
+			pushFailed = true
+			pushError = err.Error()
+		}
+	} else {
+		log.Printf("✅ Changes pushed to remote repository")
+	}
+
+	// Get the latest commit info for the response
+	latestCommit, err := repo.GetCommits(1)
+	var commitInfo map[string]interface{}
+	if err == nil && len(latestCommit) > 0 {
+		commit := latestCommit[0]
+		commitInfo = map[string]interface{}{
+			"commit_hash":   commit.FullHash,
+			"short_hash":    commit.Hash,
+			"message":       commit.Message,
+			"author":        commit.Author,
+			"author_email":  commit.Email,
+			"committed_at":  time.Unix(commit.Timestamp, 0).Format(time.RFC3339),
+			"additions":     commit.Stats.Additions,
+			"deletions":     commit.Stats.Deletions,
+			"files_changed": commit.Stats.FilesChanged,
+			"push_failed":   pushFailed,
+			"push_error":    pushError,
+		}
+	}
+
+	// Build appropriate success message
+	var successMessage string
+	if pushFailed {
+		successMessage = fmt.Sprintf("Committed locally, but push failed: %s", pushError)
+	} else {
+		successMessage = "Changes committed and pushed successfully"
+	}
+
+	a.sendStandaloneCommitResponse(payload.FolderID, true, successMessage, commitInfo)
+
+	// Send updated folder list
+	a.sendFolderListUpdate()
+}
+
+// sendStandaloneCommitResponse sends the result of a standalone commit operation.
+func (a *Agent) sendStandaloneCommitResponse(folderID string, success bool, message string, commit map[string]interface{}) {
+	responseData := map[string]interface{}{
+		"folder_id": folderID,
+		"success":   success,
+		"message":   message,
+	}
+
+	if commit != nil {
+		responseData["commit"] = commit
+	}
+
+	payload, _ := json.Marshal(responseData)
+
+	msg := &ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       "standalone_commit_response",
+		Payload:    payload,
+	}
+
+	if err := a.wsClient.SendMessage(msg); err != nil {
+		log.Printf("❌ Failed to send standalone_commit_response: %v", err)
+	} else {
+		log.Printf("📤 Sent standalone_commit_response: success=%v, message=%s", success, message)
+	}
 }

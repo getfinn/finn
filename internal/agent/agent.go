@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -9,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/getfinn/finn/internal/claude"
+	"github.com/getfinn/finn/internal/llm/providers/claude"
 	"github.com/getfinn/finn/internal/config"
 	"github.com/getfinn/finn/internal/devserver"
 	"github.com/getfinn/finn/internal/llm"
@@ -29,6 +30,12 @@ type ConversationState struct {
 	folderPath   string   // Track folder path for reprompts
 	folderID     string   // Track folder ID for commit tracking
 	files        []string // Files modified in this conversation (for selective discard)
+
+	// TTL-based cleanup: conversations are kept for a grace period after completion
+	// to handle mobile reconnection and late approvals
+	completedAt  *time.Time            // When the task completed (nil if still running)
+	diffContents map[string]string     // file_path -> diff content (for resending on reconnect)
+	isCompleted  bool                  // Whether the task has completed
 }
 
 // Agent is the main daemon agent that orchestrates all operations.
@@ -63,6 +70,10 @@ type Agent struct {
 	lastKnownHeads   map[string]string
 	lastKnownHeadsMu sync.RWMutex
 	gitSyncStop      chan struct{} // Signal to stop git sync goroutine
+
+	// Conversation state TTL cleanup
+	conversationStatesMu sync.RWMutex     // Protects conversationStates map
+	stateCleanupStop     chan struct{}    // Signal to stop state cleanup goroutine
 }
 
 // New creates a new agent instance.
@@ -82,6 +93,7 @@ func New(headless bool, dev bool) (*Agent, error) {
 		devServers:              devserver.NewManager(),
 		lastKnownHeads:          make(map[string]string),
 		gitSyncStop:             make(chan struct{}),
+		stateCleanupStop:        make(chan struct{}),
 		llmExecutors:            make(map[string]llm.Executor),
 		llmInteractiveExecutors: make(map[string]llm.InteractiveExecutor),
 	}, nil
@@ -160,6 +172,7 @@ func (a *Agent) Start() error {
 	// Start background subsystems
 	go a.monitorConnection()
 	go a.startGitSyncChecker()
+	go a.startConversationStateCleanup()
 
 	// Initialize session watcher for external Claude Code sessions
 	a.initSessionWatcher()
@@ -200,6 +213,9 @@ func (a *Agent) handleQuit() {
 	// Stop git sync checker
 	close(a.gitSyncStop)
 
+	// Stop conversation state cleanup
+	close(a.stateCleanupStop)
+
 	// Close all tunnel connections
 	a.closeAllTunnels()
 
@@ -208,4 +224,112 @@ func (a *Agent) handleQuit() {
 	}
 
 	a.isRunning = false
+}
+
+// ConversationStateTTL is how long to keep completed conversation state for late approvals.
+const ConversationStateTTL = 10 * time.Minute
+
+// startConversationStateCleanup runs a background goroutine that cleans up
+// completed conversation states after the TTL expires.
+func (a *Agent) startConversationStateCleanup() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.stateCleanupStop:
+			log.Println("🛑 Conversation state cleanup goroutine stopped")
+			return
+		case <-ticker.C:
+			a.cleanupExpiredConversationStates()
+		}
+	}
+}
+
+// cleanupExpiredConversationStates removes conversation states that have been
+// completed for longer than the TTL.
+func (a *Agent) cleanupExpiredConversationStates() {
+	a.conversationStatesMu.Lock()
+	defer a.conversationStatesMu.Unlock()
+
+	now := time.Now()
+	var toDelete []string
+
+	for convID, state := range a.conversationStates {
+		if state.isCompleted && state.completedAt != nil {
+			age := now.Sub(*state.completedAt)
+			if age > ConversationStateTTL {
+				toDelete = append(toDelete, convID)
+				log.Printf("🧹 Cleaning up expired conversation state: %s (age: %v)", convID, age)
+			}
+		}
+	}
+
+	for _, convID := range toDelete {
+		delete(a.conversationStates, convID)
+		delete(a.executors, convID)
+		delete(a.llmExecutors, convID)
+		delete(a.llmInteractiveExecutors, convID)
+	}
+}
+
+// syncPendingConversationsToMobile sends all pending (completed but not approved)
+// conversations to mobile. Called when mobile reconnects.
+func (a *Agent) syncPendingConversationsToMobile() {
+	a.conversationStatesMu.RLock()
+	defer a.conversationStatesMu.RUnlock()
+
+	var pendingConversations []map[string]interface{}
+
+	for convID, state := range a.conversationStates {
+		// Only sync conversations that are completed and have pending diffs
+		if state.isCompleted && len(state.diffContents) > 0 {
+			// Build diff list for this conversation
+			var diffs []map[string]interface{}
+			for filePath, content := range state.diffContents {
+				diffs = append(diffs, map[string]interface{}{
+					"file_path": filePath,
+					"diff":      content,
+				})
+			}
+
+			pendingConversations = append(pendingConversations, map[string]interface{}{
+				"conversation_id": convID,
+				"folder_id":       state.folderID,
+				"folder_path":     state.folderPath,
+				"files":           state.files,
+				"diffs":           diffs,
+				"total_diffs":     state.totalDiffs,
+			})
+
+			log.Printf("📤 Syncing pending conversation to mobile: %s (%d diffs)", convID, len(diffs))
+		}
+	}
+
+	if len(pendingConversations) == 0 {
+		log.Println("📤 No pending conversations to sync to mobile")
+		return
+	}
+
+	// Send pending_conversations message to mobile
+	payload, err := json.Marshal(map[string]interface{}{
+		"conversations": pendingConversations,
+	})
+	if err != nil {
+		log.Printf("❌ Failed to marshal pending conversations: %v", err)
+		return
+	}
+
+	msg := &ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       "pending_conversations",
+		Payload:    payload,
+	}
+
+	if err := a.wsClient.SendMessage(msg); err != nil {
+		log.Printf("❌ Failed to send pending_conversations: %v", err)
+	} else {
+		log.Printf("✅ Sent pending_conversations to mobile (%d conversations)", len(pendingConversations))
+	}
 }

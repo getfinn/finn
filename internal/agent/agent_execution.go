@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
-	"github.com/getfinn/finn/internal/claude"
+	"github.com/getfinn/finn/internal/llm/providers/claude"
 	"github.com/getfinn/finn/internal/git"
 	"github.com/getfinn/finn/internal/llm"
 	_ "github.com/getfinn/finn/internal/llm/providers" // Register all LLM providers
@@ -148,14 +149,17 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 	a.executors[conversationID] = interactiveExec
 
 	// Create conversation state for tracking approvals
+	a.conversationStatesMu.Lock()
 	a.conversationStates[conversationID] = &ConversationState{
 		executor:     interactiveExec,
 		provider:     llm.ProviderClaude,
 		pendingDiffs: make(map[string]bool),
+		diffContents: make(map[string]string),
 		totalDiffs:   0,
 		folderPath:   folderPath,
 		folderID:     folderID,
 	}
+	a.conversationStatesMu.Unlock()
 	log.Printf("📊 Created conversation state for: %s (folder: %s, provider: claude)", conversationID, folderID)
 
 	if sessionID != "" {
@@ -166,7 +170,9 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 				log.Printf("❌ Session resume failed: %v", err)
 				a.sendError(conversationID, err.Error())
 				delete(a.executors, conversationID)
+				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
+				a.conversationStatesMu.Unlock()
 			}
 		}()
 	} else {
@@ -176,7 +182,9 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 				log.Printf("❌ Task execution failed: %v", err)
 				a.sendError(conversationID, err.Error())
 				delete(a.executors, conversationID)
+				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
+				a.conversationStatesMu.Unlock()
 			}
 		}()
 	}
@@ -225,14 +233,17 @@ func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folder
 	a.llmInteractiveExecutors[conversationID] = executor
 
 	// Create conversation state for tracking approvals
+	a.conversationStatesMu.Lock()
 	a.conversationStates[conversationID] = &ConversationState{
 		llmExecutor:  executor,
 		provider:     llm.ProviderGemini,
 		pendingDiffs: make(map[string]bool),
+		diffContents: make(map[string]string),
 		totalDiffs:   0,
 		folderPath:   folderPath,
 		folderID:     folderID,
 	}
+	a.conversationStatesMu.Unlock()
 	log.Printf("📊 [Gemini] Created conversation state for: %s (folder: %s, provider: gemini)", conversationID, folderID)
 
 	if sessionID != "" {
@@ -242,7 +253,9 @@ func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folder
 				log.Printf("❌ [Gemini] Session resume failed: %v", err)
 				a.sendError(conversationID, err.Error())
 				delete(a.llmInteractiveExecutors, conversationID)
+				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
+				a.conversationStatesMu.Unlock()
 			}
 		}()
 	} else {
@@ -251,13 +264,16 @@ func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folder
 				log.Printf("❌ [Gemini] Task execution failed: %v", err)
 				a.sendError(conversationID, err.Error())
 				delete(a.llmInteractiveExecutors, conversationID)
+				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
+				a.conversationStatesMu.Unlock()
 			}
 		}()
 	}
 }
 
 // trackDiffEvent tracks a diff event for approval management.
+// Also stores diff content for potential resend on mobile reconnection.
 func (a *Agent) trackDiffEvent(state *ConversationState, event claude.Event) {
 	var diffData map[string]interface{}
 	if err := json.Unmarshal(event.Content, &diffData); err != nil {
@@ -266,6 +282,9 @@ func (a *Agent) trackDiffEvent(state *ConversationState, event claude.Event) {
 
 	if state.pendingDiffs == nil {
 		state.pendingDiffs = make(map[string]bool)
+	}
+	if state.diffContents == nil {
+		state.diffContents = make(map[string]string)
 	}
 
 	// Incremental diff (single file)
@@ -276,16 +295,24 @@ func (a *Agent) trackDiffEvent(state *ConversationState, event claude.Event) {
 			state.files = append(state.files, filePath)
 			log.Printf("📊 Tracking diff for approval: %s (total: %d)", filePath, state.totalDiffs)
 		}
+		// Store the diff content for potential resend on reconnection
+		if diffContent, ok := diffData["diff"].(string); ok {
+			state.diffContents[filePath] = diffContent
+		}
 	}
 
 	// Batch diff format (multiple files in "diffs" map)
 	if diffsMap, ok := diffData["diffs"].(map[string]interface{}); ok {
-		for filePath := range diffsMap {
+		for filePath, diffContent := range diffsMap {
 			if !state.pendingDiffs[filePath] {
 				state.pendingDiffs[filePath] = false
 				state.totalDiffs++
 				state.files = append(state.files, filePath)
 				log.Printf("📊 Tracking diff for approval: %s (total: %d)", filePath, state.totalDiffs)
+			}
+			// Store the diff content for potential resend on reconnection
+			if content, ok := diffContent.(string); ok {
+				state.diffContents[filePath] = content
 			}
 		}
 	}
@@ -372,10 +399,19 @@ func (a *Agent) handleApproval(msg *ws.Message) {
 		return
 	}
 
+	a.conversationStatesMu.RLock()
 	state, hasState := a.conversationStates[payload.ConversationID]
+	a.conversationStatesMu.RUnlock()
+
 	if !hasState {
 		log.Printf("❌ No conversation state for: %s (daemon may have restarted)", payload.ConversationID)
 		a.sendError(payload.ConversationID, "Conversation has expired. Please restart the task.")
+		return
+	}
+
+	// Check if already completed (late duplicate approval)
+	if state.isCompleted {
+		log.Printf("⚠️ Conversation already completed: %s (ignoring duplicate approval)", payload.ConversationID)
 		return
 	}
 
@@ -422,12 +458,23 @@ func (a *Agent) handleApproval(msg *ws.Message) {
 		}
 	}
 
-	// Clean up all executor types and conversation state
+	// Mark conversation as completed (TTL cleanup will handle actual deletion)
+	// This allows late approvals from reconnecting mobile clients to still work
+	a.conversationStatesMu.Lock()
+	if state != nil {
+		now := time.Now()
+		state.completedAt = &now
+		state.isCompleted = true
+		// Clear diff contents since changes are now committed or discarded
+		state.diffContents = nil
+		log.Printf("✅ Marked conversation as completed: %s (TTL cleanup in %v)", payload.ConversationID, ConversationStateTTL)
+	}
+	a.conversationStatesMu.Unlock()
+
+	// Clean up executors immediately (no longer needed)
 	delete(a.executors, payload.ConversationID)
 	delete(a.llmExecutors, payload.ConversationID)
 	delete(a.llmInteractiveExecutors, payload.ConversationID)
-	delete(a.conversationStates, payload.ConversationID)
-	log.Printf("🧹 Cleaned up conversation: %s", payload.ConversationID)
 }
 
 // handleDiffApproved handles approval of a specific diff file.
@@ -444,9 +491,18 @@ func (a *Agent) handleDiffApproved(msg *ws.Message) {
 
 	log.Printf("✅ Diff approved for file: %s (conversation: %s)", payload.FilePath, payload.ConversationID)
 
+	a.conversationStatesMu.RLock()
 	state, exists := a.conversationStates[payload.ConversationID]
+	a.conversationStatesMu.RUnlock()
+
 	if !exists {
 		log.Printf("⚠️  No conversation state for: %s (may have already completed)", payload.ConversationID)
+		return
+	}
+
+	// Skip if conversation already completed
+	if state.isCompleted {
+		log.Printf("⚠️ Conversation already completed: %s (ignoring diff approval)", payload.ConversationID)
 		return
 	}
 
@@ -494,10 +550,20 @@ func (a *Agent) handleReprompt(msg *ws.Message) {
 
 	log.Printf("🔄 Reprompt received: %s (conversation: %s)", payload.RepromptText, payload.ConversationID)
 
+	a.conversationStatesMu.RLock()
 	state, exists := a.conversationStates[payload.ConversationID]
+	a.conversationStatesMu.RUnlock()
+
 	if !exists {
 		log.Printf("❌ No conversation state for: %s", payload.ConversationID)
 		a.sendError(payload.ConversationID, "Conversation not found")
+		return
+	}
+
+	// Skip if conversation already completed
+	if state.isCompleted {
+		log.Printf("⚠️ Conversation already completed: %s (ignoring reprompt)", payload.ConversationID)
+		a.sendError(payload.ConversationID, "Conversation has already completed. Please start a new conversation.")
 		return
 	}
 
