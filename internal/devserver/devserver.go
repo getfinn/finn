@@ -10,10 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -294,10 +292,8 @@ func (m *Manager) Start(folderID, folderPath string, port int) (*DevServer, erro
 	cmd := exec.CommandContext(ctx, cmdName, args...)
 	cmd.Dir = folderPath
 
-	// Set up process group for proper cleanup (Unix only)
-	if runtime.GOOS != "windows" {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	}
+	// Set up platform-specific process attributes
+	setPlatformSysProcAttr(cmd)
 
 	// Set environment for CRA port
 	cmd.Env = os.Environ()
@@ -410,19 +406,8 @@ func (m *Manager) Stop(folderID string) {
 		close(done)
 	}()
 
-	// Send appropriate signal based on OS
-	if runtime.GOOS == "windows" {
-		// Windows: just kill it
-		server.Cmd.Process.Kill()
-	} else {
-		// Unix: try SIGTERM to the process group first
-		pgid, err := syscall.Getpgid(server.Cmd.Process.Pid)
-		if err == nil {
-			syscall.Kill(-pgid, syscall.SIGTERM)
-		} else {
-			server.Cmd.Process.Signal(syscall.SIGTERM)
-		}
-	}
+	// Try graceful termination first
+	terminateProcess(server.Cmd)
 
 	// Wait up to 5 seconds for graceful shutdown
 	select {
@@ -430,14 +415,7 @@ func (m *Manager) Stop(folderID string) {
 		log.Printf("✅ Dev server stopped gracefully")
 	case <-time.After(5 * time.Second):
 		log.Printf("⚠️  Dev server didn't stop gracefully, killing...")
-		if runtime.GOOS != "windows" {
-			// Kill the process group
-			pgid, err := syscall.Getpgid(server.Cmd.Process.Pid)
-			if err == nil {
-				syscall.Kill(-pgid, syscall.SIGKILL)
-			}
-		}
-		server.Cmd.Process.Kill()
+		killProcess(server.Cmd)
 	}
 
 	m.mu.Lock()

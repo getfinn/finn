@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/getfinn/finn/internal/llm/providers/claude"
@@ -198,7 +196,7 @@ func (a *Agent) monitorConnection() {
 // waitForShutdown blocks until a shutdown signal is received (for headless mode).
 func (a *Agent) waitForShutdown() {
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	notifyShutdownSignals(sigChan)
 
 	sig := <-sigChan
 	log.Printf("Received signal: %v", sig)
