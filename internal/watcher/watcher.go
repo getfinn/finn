@@ -504,8 +504,19 @@ func (w *Watcher) updateSessionFromMessage(sessionID string, msg *claude.StoredM
 	session.LastActivity = time.Now()
 	session.TotalCostUSD += msg.CostUSD
 
+	// Summary messages take highest precedence for title
 	if msg.Type == "summary" && msg.Summary != "" {
 		session.Title = msg.Summary
+		log.Printf("📝 Updated title from summary: %q", truncateString(msg.Summary, 50))
+	}
+
+	// If no title yet, try to generate from first user message
+	if session.Title == "" && msg.Type == "user" {
+		content := msg.GetTextContent()
+		if content != "" {
+			session.Title = generateTitleFromMessage(content)
+			log.Printf("📝 Generated title from new user message: %q", session.Title)
+		}
 	}
 
 	if model := msg.GetModel(); model != "" {
@@ -517,6 +528,7 @@ func (w *Watcher) updateSessionFromMessage(sessionID string, msg *claude.StoredM
 func (w *Watcher) parseSessionFile(filePath string, session *SessionInfo) {
 	file, err := os.Open(filePath)
 	if err != nil {
+		log.Printf("⚠️ Failed to open session file for parsing: %v", err)
 		return
 	}
 	defer file.Close()
@@ -528,10 +540,12 @@ func (w *Watcher) parseSessionFile(filePath string, session *SessionInfo) {
 	var firstUserMessage string    // For generating title if no summary
 	var firstAssistantText string  // Fallback: use first assistant response
 	var anyMessageContent string   // Last resort: any message with content
+	var parseErrors int
 
 	for scanner.Scan() {
 		var msg claude.StoredMessage
 		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+			parseErrors++
 			continue
 		}
 
@@ -545,6 +559,15 @@ func (w *Watcher) parseSessionFile(filePath string, session *SessionInfo) {
 		if firstUserMessage == "" && msg.Type == "user" {
 			if content != "" {
 				firstUserMessage = content
+				log.Printf("📝 Found first user message for title: %q (truncated to 50 chars)",
+					truncateString(content, 50))
+			} else {
+				// Debug: log raw message when content extraction fails for user messages
+				rawStr := string(msg.Message)
+				if len(rawStr) > 200 {
+					rawStr = rawStr[:200] + "..."
+				}
+				log.Printf("⚠️ User message has empty content. Raw message: %s", rawStr)
 			}
 		}
 
@@ -563,6 +586,7 @@ func (w *Watcher) parseSessionFile(filePath string, session *SessionInfo) {
 		// Summary messages take highest precedence for title
 		if msg.Type == "summary" && msg.Summary != "" {
 			session.Title = msg.Summary
+			log.Printf("📝 Using summary as title: %q", truncateString(msg.Summary, 50))
 		}
 
 		if model := msg.GetModel(); model != "" {
@@ -574,18 +598,38 @@ func (w *Watcher) parseSessionFile(filePath string, session *SessionInfo) {
 		}
 	}
 
+	// Log parsing stats
+	if parseErrors > 0 {
+		log.Printf("⚠️ Session %s: %d parse errors out of %d lines",
+			session.SessionID, parseErrors, session.MessageCount+parseErrors)
+	}
+
 	// Generate title with fallback chain
 	if session.Title == "" {
 		if firstUserMessage != "" {
 			session.Title = generateTitleFromMessage(firstUserMessage)
+			log.Printf("📝 Generated title from user message: %q", session.Title)
 		} else if firstAssistantText != "" {
 			// Use assistant's first response as title hint
 			session.Title = generateTitleFromMessage(firstAssistantText)
+			log.Printf("📝 Generated title from assistant (fallback): %q", session.Title)
 		} else if anyMessageContent != "" {
 			// Last resort: use any message content
 			session.Title = generateTitleFromMessage(anyMessageContent)
+			log.Printf("📝 Generated title from any content (last resort): %q", session.Title)
+		} else {
+			log.Printf("⚠️ Session %s: No content found for title generation (messages: %d)",
+				session.SessionID, session.MessageCount)
 		}
 	}
+}
+
+// truncateString truncates a string to maxLen characters
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 // generateTitleFromMessage creates a short title from a user message
