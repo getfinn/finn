@@ -72,7 +72,9 @@ func (a *Agent) handlePrompt(msg *ws.Message) {
 	onClaudeEvent := func(event claude.Event) {
 		// Track diff events to manage approval flow
 		if event.Type == claude.EventTypeDiff {
+			a.conversationStatesMu.RLock()
 			state := a.conversationStates[payload.ConversationID]
+			a.conversationStatesMu.RUnlock()
 			if state != nil {
 				a.trackDiffEvent(state, event)
 			}
@@ -89,7 +91,9 @@ func (a *Agent) handlePrompt(msg *ws.Message) {
 		}
 		// Track diff events to manage approval flow
 		if event.Type == llm.EventTypeDiff {
+			a.conversationStatesMu.RLock()
 			state := a.conversationStates[payload.ConversationID]
+			a.conversationStatesMu.RUnlock()
 			if state != nil {
 				a.trackDiffEvent(state, claudeEvent)
 			}
@@ -101,14 +105,14 @@ func (a *Agent) handlePrompt(msg *ws.Message) {
 	// Branch based on provider and execution mode
 	if llmProvider == "gemini" {
 		if !a.cfg.ExecutionMode.InteractiveMode {
-			a.startGeminiOneShotExecution(payload.ConversationID, folderPath, payload.Text, onLLMEvent)
+			a.startGeminiOneShotExecution(payload.ConversationID, payload.FolderID, folderPath, payload.Text, onLLMEvent)
 		} else {
 			a.startGeminiInteractiveExecution(payload.ConversationID, payload.FolderID, folderPath, payload.Text, payload.SessionID, onLLMEvent)
 		}
 	} else {
 		// Default to Claude
 		if !a.cfg.ExecutionMode.InteractiveMode {
-			a.startOneShotExecution(payload.ConversationID, folderPath, payload.Text, onClaudeEvent)
+			a.startOneShotExecution(payload.ConversationID, payload.FolderID, folderPath, payload.Text, onClaudeEvent)
 		} else {
 			a.startInteractiveExecution(payload.ConversationID, payload.FolderID, folderPath, payload.Text, payload.SessionID, onClaudeEvent)
 		}
@@ -116,22 +120,52 @@ func (a *Agent) handlePrompt(msg *ws.Message) {
 }
 
 // startOneShotExecution starts a one-shot execution that auto-approves everything.
-func (a *Agent) startOneShotExecution(conversationID, folderPath, prompt string, onEvent func(claude.Event)) {
+// Creates conversation state so approvals still work (user can commit changes after viewing).
+func (a *Agent) startOneShotExecution(conversationID, folderID, folderPath, prompt string, onEvent func(claude.Event)) {
 	log.Println("🚀 Using one-shot mode (auto-approve)")
 	requiresApproval := false
 	executor := claude.NewTaskExecutor(folderPath, requiresApproval, onEvent)
 
 	// Store executor
+	a.executorsMu.Lock()
 	a.executors[conversationID] = executor
+	a.executorsMu.Unlock()
 
-	// Execute and clean up after completion
+	// Create conversation state for tracking diffs and handling approvals
+	// Even in auto-approve mode, user may want to commit changes after viewing
+	a.conversationStatesMu.Lock()
+	a.conversationStates[conversationID] = &ConversationState{
+		executor:     executor,
+		provider:     llm.ProviderClaude,
+		pendingDiffs: make(map[string]bool),
+		diffContents: make(map[string]string),
+		totalDiffs:   0,
+		folderPath:   folderPath,
+		folderID:     folderID,
+	}
+	a.conversationStatesMu.Unlock()
+	log.Printf("📊 Created conversation state for one-shot: %s (folder: %s)", conversationID, folderID)
+
+	// Execute and mark completed after finish (don't delete state - TTL handles cleanup)
 	go func() {
 		if err := executor.ExecuteTask(prompt); err != nil {
 			log.Printf("❌ Task execution failed: %v", err)
 			a.sendError(conversationID, err.Error())
 		}
-		// Clean up one-shot executor after completion
+		// Clean up executor but keep conversation state for approvals
+		a.executorsMu.Lock()
 		delete(a.executors, conversationID)
+		a.executorsMu.Unlock()
+
+		// Mark conversation as completed (TTL cleanup will handle deletion)
+		a.conversationStatesMu.Lock()
+		if state, exists := a.conversationStates[conversationID]; exists {
+			state.isCompleted = true
+			now := time.Now()
+			state.completedAt = &now
+			log.Printf("✅ One-shot task completed, state preserved for approvals: %s", conversationID)
+		}
+		a.conversationStatesMu.Unlock()
 	}()
 }
 
@@ -146,7 +180,9 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 	})
 
 	// Store executor
+	a.executorsMu.Lock()
 	a.executors[conversationID] = interactiveExec
+	a.executorsMu.Unlock()
 
 	// Create conversation state for tracking approvals
 	a.conversationStatesMu.Lock()
@@ -169,7 +205,9 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 			if err := interactiveExec.ResumeSession(sessionID, prompt); err != nil {
 				log.Printf("❌ Session resume failed: %v", err)
 				a.sendError(conversationID, err.Error())
+				a.executorsMu.Lock()
 				delete(a.executors, conversationID)
+				a.executorsMu.Unlock()
 				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
 				a.conversationStatesMu.Unlock()
@@ -181,7 +219,9 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 			if err := interactiveExec.ExecuteTask(prompt); err != nil {
 				log.Printf("❌ Task execution failed: %v", err)
 				a.sendError(conversationID, err.Error())
+				a.executorsMu.Lock()
 				delete(a.executors, conversationID)
+				a.executorsMu.Unlock()
 				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
 				a.conversationStatesMu.Unlock()
@@ -191,7 +231,8 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 }
 
 // startGeminiOneShotExecution starts a one-shot Gemini execution.
-func (a *Agent) startGeminiOneShotExecution(conversationID, folderPath, prompt string, onEvent func(llm.Event)) {
+// Creates conversation state so approvals still work (user can commit changes after viewing).
+func (a *Agent) startGeminiOneShotExecution(conversationID, folderID, folderPath, prompt string, onEvent func(llm.Event)) {
 	log.Println("🚀 [Gemini] Using one-shot mode (auto-approve)")
 
 	executor, err := llm.NewExecutor(llm.ProviderGemini, folderPath, onEvent)
@@ -202,14 +243,42 @@ func (a *Agent) startGeminiOneShotExecution(conversationID, folderPath, prompt s
 	}
 
 	// Store executor (wrapped to satisfy interface)
+	a.executorsMu.Lock()
 	a.llmExecutors[conversationID] = executor
+	a.executorsMu.Unlock()
+
+	// Create conversation state for tracking diffs and handling approvals
+	// Note: executor field left nil since we don't need it for approval handling
+	a.conversationStatesMu.Lock()
+	a.conversationStates[conversationID] = &ConversationState{
+		provider:     llm.ProviderGemini,
+		pendingDiffs: make(map[string]bool),
+		diffContents: make(map[string]string),
+		totalDiffs:   0,
+		folderPath:   folderPath,
+		folderID:     folderID,
+	}
+	a.conversationStatesMu.Unlock()
+	log.Printf("📊 [Gemini] Created conversation state for one-shot: %s (folder: %s)", conversationID, folderID)
 
 	go func() {
 		if err := executor.ExecuteTask(prompt); err != nil {
 			log.Printf("❌ [Gemini] Task execution failed: %v", err)
 			a.sendError(conversationID, err.Error())
 		}
+		a.executorsMu.Lock()
 		delete(a.llmExecutors, conversationID)
+		a.executorsMu.Unlock()
+
+		// Mark conversation as completed (TTL cleanup will handle deletion)
+		a.conversationStatesMu.Lock()
+		if state, exists := a.conversationStates[conversationID]; exists {
+			state.isCompleted = true
+			now := time.Now()
+			state.completedAt = &now
+			log.Printf("✅ [Gemini] One-shot task completed, state preserved for approvals: %s", conversationID)
+		}
+		a.conversationStatesMu.Unlock()
 	}()
 }
 
@@ -230,7 +299,9 @@ func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folder
 	})
 
 	// Store executor
+	a.executorsMu.Lock()
 	a.llmInteractiveExecutors[conversationID] = executor
+	a.executorsMu.Unlock()
 
 	// Create conversation state for tracking approvals
 	a.conversationStatesMu.Lock()
@@ -252,7 +323,9 @@ func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folder
 			if err := executor.ResumeSession(sessionID, prompt); err != nil {
 				log.Printf("❌ [Gemini] Session resume failed: %v", err)
 				a.sendError(conversationID, err.Error())
+				a.executorsMu.Lock()
 				delete(a.llmInteractiveExecutors, conversationID)
+				a.executorsMu.Unlock()
 				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
 				a.conversationStatesMu.Unlock()
@@ -263,7 +336,9 @@ func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folder
 			if err := executor.Start(prompt); err != nil {
 				log.Printf("❌ [Gemini] Task execution failed: %v", err)
 				a.sendError(conversationID, err.Error())
+				a.executorsMu.Lock()
 				delete(a.llmInteractiveExecutors, conversationID)
+				a.executorsMu.Unlock()
 				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
 				a.conversationStatesMu.Unlock()
@@ -349,7 +424,10 @@ func (a *Agent) handleChoice(msg *ws.Message) {
 	}
 
 	// Check for LLM interactive executor (Gemini, etc.)
-	if llmExecutor, exists := a.llmInteractiveExecutors[payload.ConversationID]; exists {
+	a.executorsMu.RLock()
+	llmExecutor, llmExists := a.llmInteractiveExecutors[payload.ConversationID]
+	a.executorsMu.RUnlock()
+	if llmExists {
 		log.Printf("🔄 Sending choice to LLM interactive executor")
 
 		if err := llmExecutor.SendChoice(choiceMessage); err != nil {
@@ -363,7 +441,9 @@ func (a *Agent) handleChoice(msg *ws.Message) {
 	}
 
 	// Check for Claude executor
+	a.executorsMu.RLock()
 	executor, exists := a.executors[payload.ConversationID]
+	a.executorsMu.RUnlock()
 	if !exists {
 		log.Printf("❌ No active executor for conversation: %s", payload.ConversationID)
 		a.sendError(payload.ConversationID, "No active task for this conversation")
@@ -472,9 +552,11 @@ func (a *Agent) handleApproval(msg *ws.Message) {
 	a.conversationStatesMu.Unlock()
 
 	// Clean up executors immediately (no longer needed)
+	a.executorsMu.Lock()
 	delete(a.executors, payload.ConversationID)
 	delete(a.llmExecutors, payload.ConversationID)
 	delete(a.llmInteractiveExecutors, payload.ConversationID)
+	a.executorsMu.Unlock()
 }
 
 // handleDiffApproved handles approval of a specific diff file.
@@ -597,7 +679,9 @@ func (a *Agent) handleReprompt(msg *ws.Message) {
 			return
 		}
 
+		a.executorsMu.Lock()
 		a.llmInteractiveExecutors[payload.ConversationID] = executor
+		a.executorsMu.Unlock()
 		state.llmExecutor = executor
 
 		go func() {
@@ -619,7 +703,9 @@ func (a *Agent) handleReprompt(msg *ws.Message) {
 
 		executor := claude.NewInteractiveTaskExecutor(state.folderPath, onEvent)
 
+		a.executorsMu.Lock()
 		a.executors[payload.ConversationID] = executor
+		a.executorsMu.Unlock()
 		state.executor = executor
 
 		go func() {

@@ -52,6 +52,7 @@ type Agent struct {
 	// LLM executors (for Gemini, etc.)
 	llmExecutors            map[string]llm.Executor            // conversation_id -> one-shot LLM executor
 	llmInteractiveExecutors map[string]llm.InteractiveExecutor // conversation_id -> interactive LLM executor
+	executorsMu             sync.RWMutex                       // Protects executors, llmExecutors, llmInteractiveExecutors
 
 	// Client presence tracking (for skipping broadcasts when no listeners)
 	mobileOnline bool
@@ -63,6 +64,10 @@ type Agent struct {
 
 	// Dev server manager for auto-starting dev servers
 	devServers *devserver.Manager
+
+	// Spreadsheet file watcher for live updates
+	spreadsheetWatcher   *devserver.SpreadsheetWatcher
+	spreadsheetWatcherMu sync.Mutex
 
 	// Git sync tracking (folderID -> last known HEAD hash)
 	lastKnownHeads   map[string]string
@@ -263,11 +268,15 @@ func (a *Agent) cleanupExpiredConversationStates() {
 		}
 	}
 
-	for _, convID := range toDelete {
-		delete(a.conversationStates, convID)
-		delete(a.executors, convID)
-		delete(a.llmExecutors, convID)
-		delete(a.llmInteractiveExecutors, convID)
+	if len(toDelete) > 0 {
+		a.executorsMu.Lock()
+		for _, convID := range toDelete {
+			delete(a.conversationStates, convID)
+			delete(a.executors, convID)
+			delete(a.llmExecutors, convID)
+			delete(a.llmInteractiveExecutors, convID)
+		}
+		a.executorsMu.Unlock()
 	}
 }
 

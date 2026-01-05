@@ -342,20 +342,29 @@ func (a *Agent) handleResumeSession(msg *ws.Message) {
 
 	executor := claude.NewInteractiveTaskExecutor(folderPath, onEvent)
 
+	a.executorsMu.Lock()
 	a.executors[payload.ConversationID] = executor
+	a.executorsMu.Unlock()
+	a.conversationStatesMu.Lock()
 	a.conversationStates[payload.ConversationID] = &ConversationState{
 		executor:     executor,
 		folderPath:   folderPath,
 		folderID:     payload.FolderID,
 		pendingDiffs: make(map[string]bool),
+		diffContents: make(map[string]string),
 	}
+	a.conversationStatesMu.Unlock()
 
 	go func() {
 		if err := executor.ResumeSession(payload.SessionID, payload.Prompt); err != nil {
 			log.Printf("❌ Failed to resume session: %v", err)
 			a.sendError(payload.ConversationID, err.Error())
+			a.executorsMu.Lock()
 			delete(a.executors, payload.ConversationID)
+			a.executorsMu.Unlock()
+			a.conversationStatesMu.Lock()
 			delete(a.conversationStates, payload.ConversationID)
+			a.conversationStatesMu.Unlock()
 			return
 		}
 	}()

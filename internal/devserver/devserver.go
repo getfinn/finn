@@ -191,6 +191,42 @@ func IsPortInUse(port int) bool {
 	return true
 }
 
+// FindAvailablePort finds an available port starting from startPort.
+// Tries up to 100 ports before giving up.
+func FindAvailablePort(startPort int) (int, error) {
+	for port := startPort; port < startPort+100; port++ {
+		if !IsPortInUse(port) {
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no available port found in range %d-%d", startPort, startPort+100)
+}
+
+// CommonDevPorts are ports commonly used by dev servers
+var CommonDevPorts = []int{
+	3000, // React, Next.js, Express
+	3001, // Next.js alternate
+	5173, // Vite
+	5174, // Vite alternate
+	4200, // Angular
+	8080, // Various
+	8000, // Python, Django
+	4000, // Phoenix, some Node
+}
+
+// DetectRunningDevServer checks common dev server ports and returns
+// the first one that's in use (likely a running dev server).
+// Returns 0 if no dev server is detected.
+func DetectRunningDevServer() int {
+	for _, port := range CommonDevPorts {
+		if IsPortInUse(port) {
+			log.Printf("🔍 Detected running dev server on port %d", port)
+			return port
+		}
+	}
+	return 0
+}
+
 // WaitForPort waits for a port to become available with context support for cancellation
 func WaitForPort(port int, timeout time.Duration) error {
 	return WaitForPortWithContext(context.Background(), port, timeout)

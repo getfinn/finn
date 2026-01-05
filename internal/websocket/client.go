@@ -46,6 +46,9 @@ const (
 	MessageTypePreviewStop   MessageType = "preview_stop"   // Mobile/Web → Desktop: Stop preview
 	MessageTypePreviewStatus MessageType = "preview_status" // Desktop → Mobile/Web: Preview status update
 
+	// Spreadsheet Preview
+	MessageTypeSpreadsheetUpdate MessageType = "spreadsheet_update" // Desktop → Mobile/Web: Spreadsheet file changed
+
 	// maxMessageSize is the maximum message size allowed (512 KB)
 	maxMessageSize = 512 * 1024
 
