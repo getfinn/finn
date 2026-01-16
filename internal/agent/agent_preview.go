@@ -64,14 +64,11 @@ func (a *Agent) handlePreviewStart(msg *ws.Message) {
 	previewType := a.detectPreviewType(payload.PreviewType, payload.File, folder.Path)
 	log.Printf("📋 Detected preview type: %s (requested: %s)", previewType, payload.PreviewType)
 
-	// Auto-detect port if not specified, or for non-web projects (always auto-detect)
-	// For web projects, respect user's port choice (they may have started their own dev server)
-	// For spreadsheet/file projects, always auto-detect since we control the server
-	localPort := payload.LocalPort
-	if localPort == 0 || previewType != PreviewTypeWeb {
-		localPort = a.autoDetectPort(previewType)
-		log.Printf("🔌 Auto-detected port: %d (requested: %d, type: %s)", localPort, payload.LocalPort, previewType)
-	}
+	// Smart port detection for all project types
+	// Priority: 1) Existing managed server, 2) Free port
+	// This prevents showing the wrong project when another project occupies port 3000
+	localPort := a.smartPortDetection(previewType, payload.LocalPort, folder.Path, payload.FolderID)
+	log.Printf("🔌 Using port: %d (requested: %d, type: %s)", localPort, payload.LocalPort, previewType)
 
 	// Check if tunnel already exists for this folder
 	a.tunnelsMu.Lock()
@@ -432,22 +429,61 @@ func (a *Agent) sendSpreadsheetUpdate(folderID, filename string) {
 	log.Printf("📊 Spreadsheet update sent: folder=%s file=%s", folderID, filename)
 }
 
-// autoDetectPort determines the best port to use based on preview type.
-// For web projects: checks if a dev server is already running, otherwise finds available port
-// For file/spreadsheet projects: finds any available port
-func (a *Agent) autoDetectPort(previewType PreviewType) int {
-	// For web projects, first check if a dev server is already running
-	if previewType == PreviewTypeWeb {
-		if runningPort := devserver.DetectRunningDevServer(); runningPort > 0 {
-			return runningPort
+// smartPortDetection determines the best port to use based on preview type and folder.
+// Priority:
+// 1. If we already have a dev server running for this folder, use its port
+// 2. Find a free port for starting a new server
+//
+// This prevents showing the wrong project when port 3000 is occupied by a different project.
+func (a *Agent) smartPortDetection(previewType PreviewType, requestedPort int, folderPath string, folderID string) int {
+	// First, check if we already have a managed dev server for this folder
+	if existingPort := a.devServers.GetPort(folderID); existingPort > 0 {
+		log.Printf("✅ Found existing managed dev server for folder on port %d", existingPort)
+		return existingPort
+	}
+
+	// For non-web projects, always find a free port (we control the server)
+	if previewType != PreviewTypeWeb {
+		port, err := devserver.FindAvailablePort(3000)
+		if err != nil {
+			log.Printf("⚠️  Could not find available port, defaulting to 3000: %v", err)
+			return 3000
+		}
+		return port
+	}
+
+	// For web projects:
+	// 1. If requested port is not in use, use it (we'll start a server there)
+	// 2. If requested port IS in use, we can't be sure it's for our project
+	//    So find a free port to guarantee correct project
+	if requestedPort > 0 && !devserver.IsPortInUse(requestedPort) {
+		log.Printf("✅ Requested port %d is free, will start dev server there", requestedPort)
+		return requestedPort
+	}
+
+	// Find a free port starting from common dev ports
+	startPort := 3000
+	if requestedPort > 0 {
+		startPort = requestedPort
+	}
+
+	// If requested port is in use, log why we're picking a different one
+	if requestedPort > 0 && devserver.IsPortInUse(requestedPort) {
+		log.Printf("⚠️  Port %d is already in use (could be another project), finding free port", requestedPort)
+	}
+
+	port, err := devserver.FindAvailablePort(startPort)
+	if err != nil {
+		// Try from 3000 if the range after requestedPort is full
+		port, err = devserver.FindAvailablePort(3000)
+		if err != nil {
+			log.Printf("⚠️  Could not find available port, defaulting to 3000")
+			return 3000
 		}
 	}
 
-	// Find an available port starting from 3000
-	port, err := devserver.FindAvailablePort(3000)
-	if err != nil {
-		log.Printf("⚠️  Could not find available port, defaulting to 3000: %v", err)
-		return 3000
+	if requestedPort > 0 && port != requestedPort {
+		log.Printf("🔌 Using free port %d (port %d was occupied)", port, requestedPort)
 	}
 	return port
 }

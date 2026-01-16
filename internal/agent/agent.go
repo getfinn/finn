@@ -106,7 +106,7 @@ func New(headless bool, dev bool) (*Agent, error) {
 func (a *Agent) Start() error {
 	log.Println("🚀 PocketVibe Desktop Daemon starting...")
 
-	// Set up dev server crash callback to notify mobile when dev server dies
+	// Set up dev server crash callback to notify mobile and cleanup tunnel when dev server dies
 	a.devServers.SetStateChangeCallback(func(folderID string, state devserver.ServerState, err error) {
 		if state == devserver.StateFailed {
 			errMsg := "Dev server crashed"
@@ -114,6 +114,16 @@ func (a *Agent) Start() error {
 				errMsg = fmt.Sprintf("Dev server crashed: %v", err)
 			}
 			log.Printf("💥 Dev server crash detected for folder %s: %s", folderID, errMsg)
+
+			// Close the tunnel since it's now pointing to a dead port
+			a.tunnelsMu.Lock()
+			if client, ok := a.tunnels[folderID]; ok {
+				log.Printf("🔌 Closing tunnel for crashed dev server: folder=%s", folderID)
+				client.Close()
+				delete(a.tunnels, folderID)
+			}
+			a.tunnelsMu.Unlock()
+
 			a.sendPreviewStatus(folderID, "error", errMsg)
 		}
 	})

@@ -521,6 +521,23 @@ func (m *Manager) MarkRunning(folderID string) {
 	server.mu.Unlock()
 }
 
+// GetPort returns the port of a running/starting server for the folder.
+// Returns 0 if no server is managed for this folder.
+func (m *Manager) GetPort(folderID string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	server, ok := m.servers[folderID]
+	if !ok {
+		return 0
+	}
+	server.mu.RLock()
+	defer server.mu.RUnlock()
+	if server.State == StateRunning || server.State == StateStarting {
+		return server.Port
+	}
+	return 0
+}
+
 // logWriter implements io.Writer to capture dev server output
 type logWriter struct {
 	prefix string
