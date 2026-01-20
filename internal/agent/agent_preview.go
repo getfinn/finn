@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/getfinn/finn/internal/devserver"
@@ -26,21 +28,22 @@ const (
 // on the user's machine through a secure tunnel.
 //
 // Supports multiple preview types with auto-detection:
-// - "web": Starts npm dev server and proxies through tunnel (requires package.json)
+// - "web": Starts dev server and proxies through tunnel (supports Node, Go, Python, Ruby, etc.)
 // - "spreadsheet": Starts file server for Excel/CSV files with live updates
 // - "file": Generic file server for any folder
 //
-// Auto-detection logic:
-// 1. If preview_type is explicitly set, use that
-// 2. If file is specified and it's a spreadsheet, use spreadsheet preview
-// 3. If folder has package.json, use web preview
-// 4. Otherwise, use file server (for non-web projects)
+// For monorepos and multi-project folders:
+// - Discovers all projects using marker files (package.json, go.mod, Gemfile, etc.)
+// - Auto-selects based on: cached config > recent activity > context path > single project
+// - If multiple projects exist and no auto-selection is possible, prompts user to choose
 func (a *Agent) handlePreviewStart(msg *ws.Message) {
 	var payload struct {
 		FolderID    string `json:"folder_id"`
 		LocalPort   int    `json:"local_port"`
-		PreviewType string `json:"preview_type"` // "web", "spreadsheet", or "file"
-		File        string `json:"file"`         // For spreadsheet: specific file to preview
+		PreviewType string `json:"preview_type"`  // "web", "spreadsheet", or "file"
+		File        string `json:"file"`          // For spreadsheet: specific file to preview
+		ProjectPath string `json:"project_path"`  // For project picker: relative path to selected project
+		DevCommand  string `json:"dev_command"`   // For custom command: user-specified dev command
 	}
 
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -49,8 +52,8 @@ func (a *Agent) handlePreviewStart(msg *ws.Message) {
 		return
 	}
 
-	log.Printf("🔗 Preview start requested: folder=%s port=%d type=%s file=%s",
-		payload.FolderID, payload.LocalPort, payload.PreviewType, payload.File)
+	log.Printf("🔗 Preview start requested: folder=%s port=%d type=%s file=%s project_path=%s",
+		payload.FolderID, payload.LocalPort, payload.PreviewType, payload.File, payload.ProjectPath)
 
 	// Validate folder exists in config
 	folder := a.cfg.GetFolderByID(payload.FolderID)
@@ -65,8 +68,6 @@ func (a *Agent) handlePreviewStart(msg *ws.Message) {
 	log.Printf("📋 Detected preview type: %s (requested: %s)", previewType, payload.PreviewType)
 
 	// Smart port detection for all project types
-	// Priority: 1) Existing managed server, 2) Free port
-	// This prevents showing the wrong project when another project occupies port 3000
 	localPort := a.smartPortDetection(previewType, payload.LocalPort, folder.Path, payload.FolderID)
 	log.Printf("🔌 Using port: %d (requested: %d, type: %s)", localPort, payload.LocalPort, previewType)
 
@@ -76,11 +77,9 @@ func (a *Agent) handlePreviewStart(msg *ws.Message) {
 		if existing.IsConnected() {
 			a.tunnelsMu.Unlock()
 			log.Printf("⚠️  Tunnel already active for folder %s", payload.FolderID)
-			// Re-send the preview ready message based on type
 			a.sendPreviewReadyByType(payload.FolderID, existing.LocalPort(), previewType, payload.File, folder.Path)
 			return
 		}
-		// Close stale tunnel
 		existing.Close()
 		delete(a.tunnels, payload.FolderID)
 	}
@@ -100,12 +99,11 @@ func (a *Agent) handlePreviewStart(msg *ws.Message) {
 	// Handle different preview types
 	switch previewType {
 	case PreviewTypeSpreadsheet:
-		// Auto-detect spreadsheet file if not specified
 		file := payload.File
 		if file == "" {
 			files, _ := devserver.GetSpreadsheetFiles(folder.Path)
 			if len(files) > 0 {
-				file = filepath.Base(files[0]) // Use first spreadsheet found
+				file = filepath.Base(files[0])
 				log.Printf("📊 Auto-detected spreadsheet file: %s", file)
 			}
 		}
@@ -113,23 +111,117 @@ func (a *Agent) handlePreviewStart(msg *ws.Message) {
 		return
 
 	case PreviewTypeFile:
-		// Start file server for non-web projects
 		a.startFilePreview(payload.FolderID, folder.Path, localPort, token)
 		return
 	}
 
-	// PreviewTypeWeb: Standard web preview - auto-start dev server
-	_, err := a.devServers.Start(payload.FolderID, folder.Path, localPort)
+	// PreviewTypeWeb: Multi-ecosystem project detection
+	var selectedProject *devserver.DiscoveredProject
+
+	// If user selected a specific project, use it
+	if payload.ProjectPath != "" {
+		// Normalize the path - "." means root
+		normalizedPath := payload.ProjectPath
+		if normalizedPath == "." {
+			normalizedPath = ""
+		}
+
+		projectPath := folder.Path
+		if normalizedPath != "" {
+			projectPath = filepath.Join(folder.Path, normalizedPath)
+		}
+
+		// Find the project matching this path
+		projects, _ := devserver.DiscoverProjects(folder.Path, 3)
+		for i := range projects {
+			// Match by absolute path or relative path (handle "" vs "." for root)
+			projectRelPath := projects[i].RelPath
+			if projects[i].Path == projectPath ||
+				projectRelPath == normalizedPath ||
+				(projectRelPath == "" && normalizedPath == "") {
+				// Make a copy to avoid modifying the slice
+				project := projects[i]
+				selectedProject = &project
+				// Apply custom dev command if provided
+				if payload.DevCommand != "" {
+					selectedProject.DevCommand = payload.DevCommand
+					selectedProject.HasDevCmd = true
+				}
+				// Save this selection for future (use original RelPath)
+				a.devServers.SavePreviewConfig(payload.FolderID, projects[i].RelPath, payload.DevCommand)
+				log.Printf("✅ User selected project: %s (%s)", selectedProject.Name, selectedProject.RelPath)
+				break
+			}
+		}
+		if selectedProject == nil {
+			log.Printf("⚠️  Selected project not found at path: %s", payload.ProjectPath)
+		}
+	}
+
+	// If no explicit selection, use smart detection
+	if selectedProject == nil {
+		selection := a.devServers.SelectProject(payload.FolderID, folder.Path, "")
+
+		log.Printf("📦 Project discovery: found %d previewable projects (reason: %s)",
+			selection.PreviewableCount, selection.SelectionReason)
+
+		if selection.NeedsUserInput && selection.PreviewableCount > 1 {
+			// Multiple projects - send picker to mobile
+			a.sendProjectPicker(payload.FolderID, selection.AllProjects, localPort)
+			return
+		}
+
+		if selection.Selected != nil {
+			selectedProject = selection.Selected
+			log.Printf("✅ Auto-selected project: %s (reason: %s)", selectedProject.Name, selection.SelectionReason)
+		}
+	}
+
+	// Start the dev server
+	var err error
+	var projectPath string
+	if selectedProject != nil {
+		projectPath = selectedProject.Path
+	} else {
+		projectPath = folder.Path
+	}
+
+	if selectedProject != nil && selectedProject.HasDevCmd {
+		// Use new multi-ecosystem start
+		_, err = a.devServers.StartDiscoveredProject(payload.FolderID, *selectedProject, localPort)
+	} else {
+		// Fallback to legacy Node.js start
+		_, err = a.devServers.Start(payload.FolderID, folder.Path, localPort)
+	}
+
 	if err != nil {
-		log.Printf("⚠️  Could not auto-start dev server: %v", err)
-		// Don't fail - maybe user started it manually or it's a different setup
+		log.Printf("❌ Dev server start failed: %v", err)
+		errMsg := err.Error()
+
+		// Check if this is a missing dependencies error we can help with
+		if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "dependencies not installed") {
+			// Get the correct install command for the ecosystem
+			var installInfo devserver.InstallInfo
+			if selectedProject != nil {
+				installInfo = devserver.GetInstallCommand(projectPath, selectedProject.Ecosystem)
+			} else {
+				// Fallback to Node.js if we don't know the ecosystem
+				installInfo = devserver.GetInstallCommand(projectPath, devserver.EcosystemNode)
+			}
+			a.sendInstallRequired(payload.FolderID, projectPath, installInfo.Command, errMsg)
+			return
+		}
+
+		// Send error to client immediately
+		a.sendPreviewStatus(payload.FolderID, "error", errMsg)
+		return
 	}
 
 	// Wait for the port to be ready (up to 30 seconds)
 	log.Printf("⏳ Waiting for dev server on port %d...", localPort)
 	if err := devserver.WaitForPort(localPort, 30*time.Second); err != nil {
 		log.Printf("❌ Dev server not ready: %v", err)
-		a.sendPreviewStatus(payload.FolderID, "error", "Dev server failed to start - check that the project is set up correctly")
+		a.sendPreviewStatus(payload.FolderID, "error", "Dev server failed to start. Check that dependencies are installed and the project builds correctly.")
 		return
 	}
 	log.Printf("✅ Dev server is ready on port %d", localPort)
@@ -490,6 +582,7 @@ func (a *Agent) smartPortDetection(previewType PreviewType, requestedPort int, f
 
 // detectPreviewType determines the appropriate preview type based on folder contents.
 // Priority: explicit type > file detection > folder analysis
+// Uses multi-ecosystem detection to support Node.js, Go, Python, Ruby, Rust, Java, PHP, .NET, Elixir
 func (a *Agent) detectPreviewType(requestedType, file, folderPath string) PreviewType {
 	// 1. If explicitly requested, use that
 	if requestedType != "" {
@@ -501,27 +594,33 @@ func (a *Agent) detectPreviewType(requestedType, file, folderPath string) Previe
 		return PreviewTypeSpreadsheet
 	}
 
-	// 3. Check project type once (avoid duplicate calls)
-	projectType, projectErr := devserver.DetectProjectType(folderPath)
-	isWebProject := projectErr == nil && projectType != devserver.ProjectTypeUnknown
+	// 3. Use multi-ecosystem project discovery
+	projects, _ := devserver.DiscoverProjects(folderPath, 3)
+	hasPreviewableProject := false
+	for _, p := range projects {
+		if p.HasDevCmd {
+			hasPreviewableProject = true
+			break
+		}
+	}
 
 	// 4. Check if folder has spreadsheet files
 	spreadsheetFiles, _ := devserver.GetSpreadsheetFiles(folderPath)
 	hasSpreadsheets := len(spreadsheetFiles) > 0
 
-	// 5. If spreadsheets exist but no web project, use spreadsheet preview
-	if hasSpreadsheets && !isWebProject {
+	// 5. If spreadsheets exist but no previewable project, use spreadsheet preview
+	if hasSpreadsheets && !hasPreviewableProject {
 		log.Printf("📊 Auto-detected spreadsheet project: %d Excel/CSV file(s) found", len(spreadsheetFiles))
 		return PreviewTypeSpreadsheet
 	}
 
-	// 6. If it's a web project, use web preview
-	if isWebProject {
+	// 6. If any previewable project exists, use web preview
+	if hasPreviewableProject {
 		return PreviewTypeWeb
 	}
 
-	// 7. Default to file server for non-web projects
-	log.Printf("📁 No web project detected, using file server mode")
+	// 7. Default to file server for non-project folders
+	log.Printf("📁 No previewable project detected, using file server mode")
 	return PreviewTypeFile
 }
 
@@ -614,4 +713,173 @@ func (a *Agent) sendFilePreviewReady(folderID string, localPort int) {
 	})
 
 	log.Printf("✅ File preview ready: folder=%s port=%d", folderID, localPort)
+}
+
+// sendProjectPicker sends a project picker message to mobile when multiple projects are detected.
+// The mobile client will display a selection UI and respond with a preview_start containing the selected project.
+func (a *Agent) sendProjectPicker(folderID string, projects []devserver.DiscoveredProject, suggestedPort int) {
+	// Convert to serializable format with relevant fields
+	type ProjectOption struct {
+		Name       string `json:"name"`
+		Path       string `json:"path"`        // Relative path from folder root
+		Ecosystem  string `json:"ecosystem"`   // node, go, python, ruby, etc.
+		Framework  string `json:"framework"`   // nextjs, rails, django, etc.
+		HasDevCmd  bool   `json:"has_dev_cmd"`
+		DevCommand string `json:"dev_command,omitempty"`
+	}
+
+	options := make([]ProjectOption, 0, len(projects))
+	for _, p := range projects {
+		if !p.HasDevCmd {
+			continue // Only show previewable projects
+		}
+		relPath := p.RelPath
+		if relPath == "" {
+			relPath = "." // Root folder
+		}
+		options = append(options, ProjectOption{
+			Name:       p.Name,
+			Path:       relPath,
+			Ecosystem:  string(p.Ecosystem),
+			Framework:  p.Framework,
+			HasDevCmd:  p.HasDevCmd,
+			DevCommand: p.DevCommand,
+		})
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"folder_id":      folderID,
+		"projects":       options,
+		"suggested_port": suggestedPort,
+		"message":        "Multiple projects detected. Select which one to preview.",
+	})
+
+	a.wsClient.SendMessage(&ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       ws.MessageTypeProjectPicker,
+		Payload:    payload,
+	})
+
+	// Also send a status update
+	a.sendPreviewStatus(folderID, "project_selection", "")
+
+	log.Printf("📋 Project picker sent: folder=%s projects=%d", folderID, len(options))
+}
+
+// sendInstallRequired sends a message to mobile when dependencies need to be installed.
+// Mobile can then prompt the user and send back an install request.
+func (a *Agent) sendInstallRequired(folderID, projectPath, installCommand, errorMsg string) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"folder_id":       folderID,
+		"project_path":    projectPath,
+		"install_command": installCommand,
+		"error":           errorMsg,
+		"message":         fmt.Sprintf("Dependencies not installed. Run '%s' to install them.", installCommand),
+	})
+
+	a.wsClient.SendMessage(&ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       ws.MessageTypeInstallRequired,
+		Payload:    payload,
+	})
+
+	// Also send status update so mobile knows we're waiting
+	a.sendPreviewStatus(folderID, "install_required", errorMsg)
+
+	log.Printf("📦 Install required: folder=%s command=%s", folderID, installCommand)
+}
+
+// handleInstallDeps handles a request from mobile to install dependencies.
+func (a *Agent) handleInstallDeps(msg *ws.Message) {
+	var payload struct {
+		FolderID       string `json:"folder_id"`
+		ProjectPath    string `json:"project_path"`
+		InstallCommand string `json:"install_command"`
+	}
+
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Printf("❌ Failed to unmarshal install_deps payload: %v", err)
+		return
+	}
+
+	log.Printf("📦 Install deps requested: folder=%s path=%s cmd=%s",
+		payload.FolderID, payload.ProjectPath, payload.InstallCommand)
+
+	// Validate folder
+	folder := a.cfg.GetFolderByID(payload.FolderID)
+	if folder == nil {
+		log.Printf("❌ Folder not found: %s", payload.FolderID)
+		a.sendPreviewStatus(payload.FolderID, "error", "Folder not found")
+		return
+	}
+
+	// Determine project path
+	projectPath := payload.ProjectPath
+	if projectPath == "" {
+		projectPath = folder.Path
+	}
+
+	// Calculate relative path for auto-restart after install
+	relProjectPath, _ := filepath.Rel(folder.Path, projectPath)
+	if relProjectPath == "." {
+		relProjectPath = ""
+	}
+
+	// Send installing status
+	a.sendPreviewStatus(payload.FolderID, "installing", fmt.Sprintf("Running %s...", payload.InstallCommand))
+
+	// Run the install command (will auto-restart preview on success)
+	go a.runInstallCommand(payload.FolderID, projectPath, relProjectPath, payload.InstallCommand)
+}
+
+// runInstallCommand executes an install command and auto-restarts preview on success.
+func (a *Agent) runInstallCommand(folderID, projectPath, relProjectPath, installCommand string) {
+	log.Printf("📦 Running install: %s in %s", installCommand, projectPath)
+
+	// Parse the command
+	parts := strings.Fields(installCommand)
+	if len(parts) == 0 {
+		a.sendPreviewStatus(folderID, "error", "Invalid install command")
+		return
+	}
+
+	// Create command
+	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd.Dir = projectPath
+
+	// Run and capture output
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("❌ Install failed: %v\nOutput: %s", err, string(output))
+		// Send error with last few lines of output
+		lines := strings.Split(string(output), "\n")
+		lastLines := lines
+		if len(lines) > 5 {
+			lastLines = lines[len(lines)-5:]
+		}
+		a.sendPreviewStatus(folderID, "error",
+			fmt.Sprintf("Install failed: %s\n%s", err.Error(), strings.Join(lastLines, "\n")))
+		return
+	}
+
+	log.Printf("✅ Install completed successfully, auto-starting preview...")
+
+	// Auto-restart preview with the same project
+	// Create a synthetic message to trigger preview start
+	payload, _ := json.Marshal(map[string]interface{}{
+		"folder_id":    folderID,
+		"project_path": relProjectPath,
+	})
+
+	syntheticMsg := &ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       ws.MessageTypePreviewStart,
+		Payload:    payload,
+	}
+
+	// Handle preview start (this will skip the picker since project_path is specified)
+	a.handlePreviewStart(syntheticMsg)
 }

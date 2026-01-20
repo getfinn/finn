@@ -77,6 +77,12 @@ type Agent struct {
 	// Conversation state TTL cleanup
 	conversationStatesMu sync.RWMutex     // Protects conversationStates map
 	stateCleanupStop     chan struct{}    // Signal to stop state cleanup goroutine
+
+	// PocketVibe-initiated session tracking (to prevent duplicate conversations)
+	// When a prompt comes from mobile, we track the folder path until session is linked
+	// This prevents the session watcher from creating a duplicate conversation entry
+	activePocketVibeSessions map[string]time.Time // folderPath -> startedAt
+	pocketVibeSessionsMu     sync.RWMutex
 }
 
 // New creates a new agent instance.
@@ -87,18 +93,19 @@ func New(headless bool, dev bool) (*Agent, error) {
 	}
 
 	return &Agent{
-		cfg:                     cfg,
-		isRunning:               false,
-		headless:                headless,
-		executors:               make(map[string]claude.TaskRunner),
-		conversationStates:      make(map[string]*ConversationState),
-		tunnels:                 make(map[string]*tunnel.Client),
-		devServers:              devserver.NewManager(),
-		lastKnownHeads:          make(map[string]string),
-		gitSyncStop:             make(chan struct{}),
-		stateCleanupStop:        make(chan struct{}),
-		llmExecutors:            make(map[string]llm.Executor),
-		llmInteractiveExecutors: make(map[string]llm.InteractiveExecutor),
+		cfg:                      cfg,
+		isRunning:                false,
+		headless:                 headless,
+		executors:                make(map[string]claude.TaskRunner),
+		conversationStates:       make(map[string]*ConversationState),
+		tunnels:                  make(map[string]*tunnel.Client),
+		devServers:               devserver.NewManager(),
+		lastKnownHeads:           make(map[string]string),
+		gitSyncStop:              make(chan struct{}),
+		stateCleanupStop:         make(chan struct{}),
+		llmExecutors:             make(map[string]llm.Executor),
+		llmInteractiveExecutors:  make(map[string]llm.InteractiveExecutor),
+		activePocketVibeSessions: make(map[string]time.Time),
 	}, nil
 }
 
@@ -349,4 +356,41 @@ func (a *Agent) syncPendingConversationsToMobile() {
 	} else {
 		log.Printf("✅ Sent pending_conversations to mobile (%d conversations)", len(pendingConversations))
 	}
+}
+
+// MarkPocketVibeSession marks a folder as having an active PocketVibe-initiated session.
+// This prevents the session watcher from creating duplicate conversation entries.
+func (a *Agent) MarkPocketVibeSession(folderPath string) {
+	a.pocketVibeSessionsMu.Lock()
+	defer a.pocketVibeSessionsMu.Unlock()
+	a.activePocketVibeSessions[folderPath] = time.Now()
+	log.Printf("📌 Marked PocketVibe session for folder: %s", folderPath)
+}
+
+// UnmarkPocketVibeSession removes the PocketVibe session marker for a folder.
+// Called when the session is successfully linked or when the task fails.
+func (a *Agent) UnmarkPocketVibeSession(folderPath string) {
+	a.pocketVibeSessionsMu.Lock()
+	defer a.pocketVibeSessionsMu.Unlock()
+	if _, exists := a.activePocketVibeSessions[folderPath]; exists {
+		delete(a.activePocketVibeSessions, folderPath)
+		log.Printf("📌 Unmarked PocketVibe session for folder: %s", folderPath)
+	}
+}
+
+// IsPocketVibeSession checks if a folder has an active PocketVibe-initiated session.
+// Used by the session watcher to skip broadcasting external_session_detected events
+// for sessions that were started via the mobile app (to avoid duplicate conversations).
+func (a *Agent) IsPocketVibeSession(folderPath string) bool {
+	a.pocketVibeSessionsMu.RLock()
+	defer a.pocketVibeSessionsMu.RUnlock()
+	startedAt, exists := a.activePocketVibeSessions[folderPath]
+	if !exists {
+		return false
+	}
+	// Consider sessions older than 5 minutes as stale (in case unmark wasn't called)
+	if time.Since(startedAt) > 5*time.Minute {
+		return false
+	}
+	return true
 }

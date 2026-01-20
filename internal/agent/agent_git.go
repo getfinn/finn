@@ -59,7 +59,7 @@ func (a *Agent) handleGitInit(msg *ws.Message) {
 
 // sendGitInitResponse sends the result of a git init operation.
 func (a *Agent) sendGitInitResponse(folderID string, success bool, message string) {
-	payload, _ := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]any{
 		"folder_id": folderID,
 		"success":   success,
 		"message":   message,
@@ -78,7 +78,7 @@ func (a *Agent) sendGitInitResponse(folderID string, success bool, message strin
 }
 
 // getCommitsForFolder retrieves git commits for a folder.
-func (a *Agent) getCommitsForFolder(folderPath string) []map[string]interface{} {
+func (a *Agent) getCommitsForFolder(folderPath string) []map[string]any {
 	if !git.IsGitRepo(folderPath) {
 		return nil
 	}
@@ -94,9 +94,9 @@ func (a *Agent) getCommitsForFolder(folderPath string) []map[string]interface{} 
 		return nil
 	}
 
-	result := make([]map[string]interface{}, 0, len(commits))
+	result := make([]map[string]any, 0, len(commits))
 	for _, commit := range commits {
-		result = append(result, map[string]interface{}{
+		result = append(result, map[string]any{
 			"commit_hash":   commit.FullHash,
 			"short_hash":    commit.Hash,
 			"message":       commit.Message,
@@ -196,9 +196,9 @@ func (a *Agent) checkFolderForGitChanges(folderID, folderPath, folderName string
 
 // sendSyncCommits sends new commits to the relay server.
 func (a *Agent) sendSyncCommits(folderID string, commits []git.CommitInfo) {
-	commitData := make([]map[string]interface{}, 0, len(commits))
+	commitData := make([]map[string]any, 0, len(commits))
 	for _, commit := range commits {
-		commitData = append(commitData, map[string]interface{}{
+		commitData = append(commitData, map[string]any{
 			"commit_hash":   commit.FullHash,
 			"short_hash":    commit.Hash,
 			"message":       commit.Message,
@@ -211,7 +211,7 @@ func (a *Agent) sendSyncCommits(folderID string, commits []git.CommitInfo) {
 		})
 	}
 
-	payload, _ := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]any{
 		"folder_id": folderID,
 		"commits":   commitData,
 	})
@@ -275,7 +275,7 @@ func (a *Agent) handleRequestCommitSync(msg *ws.Message) {
 		log.Printf("✅ Commit sync complete: synced %d commits from %d folders", totalSynced, foldersCount)
 	}
 
-	ackPayload, _ := json.Marshal(map[string]interface{}{
+	ackPayload, _ := json.Marshal(map[string]any{
 		"folder_id":     payload.FolderID,
 		"folders_count": foldersCount,
 		"commits_count": totalSynced,
@@ -339,9 +339,9 @@ func (a *Agent) handleGetCommits(msg *ws.Message) {
 		return
 	}
 
-	commitData := make([]map[string]interface{}, 0, len(commits))
+	commitData := make([]map[string]any, 0, len(commits))
 	for _, commit := range commits {
-		commitData = append(commitData, map[string]interface{}{
+		commitData = append(commitData, map[string]any{
 			"commit_hash":   commit.FullHash,
 			"short_hash":    commit.Hash,
 			"message":       commit.Message,
@@ -354,7 +354,7 @@ func (a *Agent) handleGetCommits(msg *ws.Message) {
 		})
 	}
 
-	responsePayload, _ := json.Marshal(map[string]interface{}{
+	responsePayload, _ := json.Marshal(map[string]any{
 		"folder_id": payload.FolderID,
 		"commits":   commitData,
 	})
@@ -375,7 +375,7 @@ func (a *Agent) handleGetCommits(msg *ws.Message) {
 
 // sendCommitListError sends an error response for commit list request.
 func (a *Agent) sendCommitListError(folderID, errMsg string) {
-	payload, _ := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]any{
 		"folder_id": folderID,
 		"error":     errMsg,
 		"commits":   []interface{}{},
@@ -427,7 +427,7 @@ func (a *Agent) handleGetCommitDetail(msg *ws.Message) {
 		return
 	}
 
-	responsePayload, _ := json.Marshal(map[string]interface{}{
+	responsePayload, _ := json.Marshal(map[string]any{
 		"folder_id":     payload.FolderID,
 		"commit_hash":   detail.FullHash,
 		"short_hash":    detail.Hash,
@@ -457,7 +457,7 @@ func (a *Agent) handleGetCommitDetail(msg *ws.Message) {
 
 // sendCommitDetailError sends an error response for commit detail request.
 func (a *Agent) sendCommitDetailError(folderID, commitHash, errMsg string) {
-	payload, _ := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]any{
 		"folder_id":   folderID,
 		"commit_hash": commitHash,
 		"error":       errMsg,
@@ -485,7 +485,7 @@ func (a *Agent) sendCommitSuccess(conversationID string, folderPath string, fold
 
 	commit := latestCommit[0]
 
-	payload, _ := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]any{
 		"conversation_id": conversationID,
 		"folder_id":       folderID,
 		"commit_hash":     commit.FullHash,
@@ -514,6 +514,67 @@ func (a *Agent) sendCommitSuccess(conversationID string, folderPath string, fold
 
 	// Also send updated folder list with new commits
 	a.sendFolderListUpdate()
+}
+
+// Constants for diff size limiting
+const (
+	// maxDiffSize is the maximum size of a single diff in bytes (50KB)
+	maxDiffSize = 50 * 1024
+	// maxTotalDiffsSize is the maximum total size of all diffs in bytes (400KB, leaving room for JSON overhead)
+	maxTotalDiffsSize = 400 * 1024
+)
+
+// skipPatterns contains path patterns that should be skipped when generating diffs
+var skipPatterns = []string{
+	".next/",
+	".nuxt/",
+	".svelte-kit/",
+	".astro/",
+	".vercel/",
+	".netlify/",
+	".turbo/",
+	".cache/",
+	".parcel-cache/",
+	"node_modules/",
+	"__pycache__/",
+	".venv/",
+	"venv/",
+	"vendor/",
+	"target/",
+	"dist/",
+	"build/",
+	"out/",
+	".git/",
+}
+
+// binaryExtensions contains file extensions that are typically binary
+var binaryExtensions = []string{
+	".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".svg",
+	".woff", ".woff2", ".ttf", ".eot", ".otf",
+	".pdf", ".zip", ".tar", ".gz", ".rar",
+	".exe", ".dll", ".so", ".dylib",
+	".mp3", ".mp4", ".wav", ".avi", ".mov",
+	".pack", ".pack.gz", ".idx",
+}
+
+// shouldSkipFile returns true if the file should be skipped for diff generation
+func shouldSkipFile(filePath string) bool {
+	// Check skip patterns
+	for _, pattern := range skipPatterns {
+		if strings.Contains(filePath, pattern) {
+			return true
+		}
+	}
+
+	// Check binary extensions
+	lowerPath := strings.ToLower(filePath)
+	for _, ext := range binaryExtensions {
+		if strings.HasSuffix(lowerPath, ext) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // handleGetUncommittedDiffs handles a request for uncommitted file diffs (standalone, not tied to conversation).
@@ -560,9 +621,44 @@ func (a *Agent) handleGetUncommittedDiffs(msg *ws.Message) {
 		return
 	}
 
-	// Convert to array format for response
-	var filesArray []map[string]interface{}
+	// Convert to array format for response, with size limiting
+	var filesArray []map[string]any
+	totalSize := 0
+	skippedCount := 0
+	truncatedCount := 0
+
 	for filePath, diff := range diffs {
+		// Skip files in build directories or binary files
+		if shouldSkipFile(filePath) {
+			skippedCount++
+			continue
+		}
+
+		// Check if adding this diff would exceed total size limit
+		diffSize := len(diff)
+		if totalSize+diffSize > maxTotalDiffsSize {
+			log.Printf("⚠️  Skipping remaining files: total size limit reached (%d bytes)", totalSize)
+			skippedCount += len(diffs) - len(filesArray) - skippedCount
+			break
+		}
+
+		// Truncate individual large diffs
+		truncated := false
+		if diffSize > maxDiffSize {
+			// Find a good truncation point (end of a line)
+			truncateAt := maxDiffSize
+			for i := maxDiffSize; i > maxDiffSize-1000 && i > 0; i-- {
+				if diff[i] == '\n' {
+					truncateAt = i
+					break
+				}
+			}
+			diff = diff[:truncateAt] + "\n\n... (diff truncated, file too large to display fully)"
+			truncated = true
+			truncatedCount++
+			log.Printf("⚠️  Truncated large diff for %s: %d -> %d bytes", filePath, diffSize, len(diff))
+		}
+
 		// Parse additions/deletions from diff
 		additions, deletions := 0, 0
 		for _, line := range strings.Split(diff, "\n") {
@@ -573,19 +669,28 @@ func (a *Agent) handleGetUncommittedDiffs(msg *ws.Message) {
 			}
 		}
 
-		filesArray = append(filesArray, map[string]interface{}{
+		fileEntry := map[string]any{
 			"file_path": filePath,
 			"diff":      diff,
 			"additions": additions,
 			"deletions": deletions,
-		})
+		}
+		if truncated {
+			fileEntry["truncated"] = true
+		}
+
+		filesArray = append(filesArray, fileEntry)
+		totalSize += len(diff)
 	}
 
-	log.Printf("📤 Sending %d uncommitted diffs for folder: %s", len(filesArray), payload.FolderID)
+	log.Printf("📤 Sending %d uncommitted diffs for folder: %s (skipped: %d, truncated: %d, total size: %d bytes)",
+		len(filesArray), payload.FolderID, skippedCount, truncatedCount, totalSize)
 
-	responsePayload, _ := json.Marshal(map[string]interface{}{
-		"folder_id": payload.FolderID,
-		"files":     filesArray,
+	responsePayload, _ := json.Marshal(map[string]any{
+		"folder_id":       payload.FolderID,
+		"files":           filesArray,
+		"skipped_count":   skippedCount,
+		"truncated_count": truncatedCount,
 	})
 
 	responseMsg := &ws.Message{
@@ -602,10 +707,10 @@ func (a *Agent) handleGetUncommittedDiffs(msg *ws.Message) {
 
 // sendUncommittedDiffsError sends an error response for uncommitted diffs request.
 func (a *Agent) sendUncommittedDiffsError(folderID string, errMsg string) {
-	payload, _ := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]any{
 		"folder_id": folderID,
 		"error":     errMsg,
-		"files":     []map[string]interface{}{},
+		"files":     []map[string]any{},
 	})
 
 	msg := &ws.Message{
@@ -707,10 +812,10 @@ func (a *Agent) handleStandaloneCommit(msg *ws.Message) {
 
 	// Get the latest commit info for the response
 	latestCommit, err := repo.GetCommits(1)
-	var commitInfo map[string]interface{}
+	var commitInfo map[string]any
 	if err == nil && len(latestCommit) > 0 {
 		commit := latestCommit[0]
-		commitInfo = map[string]interface{}{
+		commitInfo = map[string]any{
 			"commit_hash":   commit.FullHash,
 			"short_hash":    commit.Hash,
 			"message":       commit.Message,
@@ -740,8 +845,8 @@ func (a *Agent) handleStandaloneCommit(msg *ws.Message) {
 }
 
 // sendStandaloneCommitResponse sends the result of a standalone commit operation.
-func (a *Agent) sendStandaloneCommitResponse(folderID string, success bool, message string, commit map[string]interface{}) {
-	responseData := map[string]interface{}{
+func (a *Agent) sendStandaloneCommitResponse(folderID string, success bool, message string, commit map[string]any) {
+	responseData := map[string]any{
 		"folder_id": folderID,
 		"success":   success,
 		"message":   message,

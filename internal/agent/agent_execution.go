@@ -102,6 +102,10 @@ func (a *Agent) handlePrompt(msg *ws.Message) {
 		a.sendClaudeEvent(payload.ConversationID, claudeEvent)
 	}
 
+	// Mark this folder as having a PocketVibe-initiated session
+	// This prevents the session watcher from creating duplicate conversation entries
+	a.MarkPocketVibeSession(folderPath)
+
 	// Branch based on provider and execution mode
 	if llmProvider == "gemini" {
 		if !a.cfg.ExecutionMode.InteractiveMode {
@@ -166,6 +170,9 @@ func (a *Agent) startOneShotExecution(conversationID, folderID, folderPath, prom
 			log.Printf("✅ One-shot task completed, state preserved for approvals: %s", conversationID)
 		}
 		a.conversationStatesMu.Unlock()
+
+		// Unmark PocketVibe session now that execution is complete
+		a.UnmarkPocketVibeSession(folderPath)
 	}()
 }
 
@@ -177,6 +184,8 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 	// Set up session linking callback
 	interactiveExec.SetSessionLinkedHandler(func(sid string) {
 		a.sendSessionLinked(conversationID, sid, folderID)
+		// Unmark the PocketVibe session once it's linked (dedup is now handled by relay)
+		a.UnmarkPocketVibeSession(folderPath)
 	})
 
 	// Store executor
@@ -211,6 +220,8 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
 				a.conversationStatesMu.Unlock()
+				// Unmark PocketVibe session on error to prevent leaks
+				a.UnmarkPocketVibeSession(folderPath)
 			}
 		}()
 	} else {
@@ -225,6 +236,8 @@ func (a *Agent) startInteractiveExecution(conversationID, folderID, folderPath, 
 				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
 				a.conversationStatesMu.Unlock()
+				// Unmark PocketVibe session on error to prevent leaks
+				a.UnmarkPocketVibeSession(folderPath)
 			}
 		}()
 	}
@@ -239,6 +252,8 @@ func (a *Agent) startGeminiOneShotExecution(conversationID, folderID, folderPath
 	if err != nil {
 		log.Printf("❌ [Gemini] Failed to create executor: %v", err)
 		a.sendError(conversationID, fmt.Sprintf("Failed to create Gemini executor: %v", err))
+		// Unmark PocketVibe session on error to prevent leaks
+		a.UnmarkPocketVibeSession(folderPath)
 		return
 	}
 
@@ -279,6 +294,9 @@ func (a *Agent) startGeminiOneShotExecution(conversationID, folderID, folderPath
 			log.Printf("✅ [Gemini] One-shot task completed, state preserved for approvals: %s", conversationID)
 		}
 		a.conversationStatesMu.Unlock()
+
+		// Unmark PocketVibe session now that execution is complete
+		a.UnmarkPocketVibeSession(folderPath)
 	}()
 }
 
@@ -290,12 +308,16 @@ func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folder
 	if err != nil {
 		log.Printf("❌ [Gemini] Failed to create interactive executor: %v", err)
 		a.sendError(conversationID, fmt.Sprintf("Failed to create Gemini executor: %v", err))
+		// Unmark PocketVibe session on error to prevent leaks
+		a.UnmarkPocketVibeSession(folderPath)
 		return
 	}
 
 	// Set up session linking callback
 	executor.SetSessionLinkedHandler(func(sid string) {
 		a.sendSessionLinked(conversationID, sid, folderID)
+		// Unmark the PocketVibe session once it's linked (dedup is now handled by relay)
+		a.UnmarkPocketVibeSession(folderPath)
 	})
 
 	// Store executor
@@ -329,6 +351,8 @@ func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folder
 				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
 				a.conversationStatesMu.Unlock()
+				// Unmark PocketVibe session on error to prevent leaks
+				a.UnmarkPocketVibeSession(folderPath)
 			}
 		}()
 	} else {
@@ -342,6 +366,8 @@ func (a *Agent) startGeminiInteractiveExecution(conversationID, folderID, folder
 				a.conversationStatesMu.Lock()
 				delete(a.conversationStates, conversationID)
 				a.conversationStatesMu.Unlock()
+				// Unmark PocketVibe session on error to prevent leaks
+				a.UnmarkPocketVibeSession(folderPath)
 			}
 		}()
 	}
@@ -832,6 +858,8 @@ func (a *Agent) sendClaudeEvent(conversationID string, event claude.Event) {
 		msgType = ws.MessageTypeThinking
 	case claude.EventTypeToolUse:
 		msgType = ws.MessageTypeToolUse
+		// Track file activity for preview auto-selection
+		a.trackToolUseActivity(conversationID, event)
 	case claude.EventTypeDecision:
 		msgType = ws.MessageTypeDecision
 	case claude.EventTypeProgress:
@@ -866,6 +894,45 @@ func (a *Agent) sendClaudeEvent(conversationID string, event claude.Event) {
 		log.Printf("Failed to send event: %v", err)
 	} else {
 		log.Printf("📤 Sent %s event to mobile", msgType)
+	}
+}
+
+// trackToolUseActivity extracts file paths from tool_use events and records them
+// for preview auto-selection in monorepo scenarios.
+func (a *Agent) trackToolUseActivity(conversationID string, event claude.Event) {
+	// Parse tool_use content: {"tool": "...", "input": {"file_path": "..."}}
+	var toolInfo struct {
+		Tool  string          `json:"tool"`
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(event.Content, &toolInfo); err != nil {
+		return
+	}
+
+	// Only track file modification tools
+	switch toolInfo.Tool {
+	case "Edit", "Write", "edit", "write", "write_file", "edit_file":
+		// Extract file_path from input
+		var input struct {
+			FilePath string `json:"file_path"`
+		}
+		if err := json.Unmarshal(toolInfo.Input, &input); err != nil {
+			return
+		}
+		if input.FilePath == "" {
+			return
+		}
+
+		// Get the folder ID for this conversation
+		a.conversationStatesMu.RLock()
+		state := a.conversationStates[conversationID]
+		a.conversationStatesMu.RUnlock()
+		if state == nil {
+			return
+		}
+
+		// Record activity for preview auto-selection
+		a.devServers.RecordFileActivity(state.folderID, input.FilePath)
 	}
 }
 

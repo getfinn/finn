@@ -42,6 +42,14 @@ func (a *Agent) initSessionWatcher() {
 
 // handleExternalSessionDetected is called when a new Claude Code session is found.
 func (a *Agent) handleExternalSessionDetected(session *watcher.SessionInfo) {
+	// Check if this session was initiated via PocketVibe (mobile app)
+	// If so, skip broadcasting to avoid creating duplicate conversation entries
+	if a.IsPocketVibeSession(session.ProjectPath) {
+		log.Printf("⏭️  Skipping external_session_detected for PocketVibe-initiated session: %s (folder: %s)",
+			session.SessionID, session.ProjectPath)
+		return
+	}
+
 	if !a.hasActiveClients() {
 		log.Printf("📡 New session %s (skipping broadcast - no clients)", session.SessionID)
 		return

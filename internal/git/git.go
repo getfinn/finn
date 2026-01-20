@@ -334,13 +334,13 @@ func (r *Repository) DiscardFile(filePath string) error {
 
 // CommitInfo represents metadata about a git commit
 type CommitInfo struct {
-	Hash        string `json:"hash"`          // Short hash (7 chars)
-	FullHash    string `json:"full_hash"`     // Full commit hash
-	Message     string `json:"message"`       // First line of commit message
-	FullMessage string `json:"full_message"`  // Complete commit message
-	Author      string `json:"author"`        // Author name
-	Email       string `json:"email"`         // Author email
-	Timestamp   int64  `json:"timestamp"`     // Unix timestamp
+	Hash        string `json:"hash"`         // Short hash (7 chars)
+	FullHash    string `json:"full_hash"`    // Full commit hash
+	Message     string `json:"message"`      // First line of commit message
+	FullMessage string `json:"full_message"` // Complete commit message
+	Author      string `json:"author"`       // Author name
+	Email       string `json:"email"`        // Author email
+	Timestamp   int64  `json:"timestamp"`    // Unix timestamp
 	Stats       struct {
 		Additions    int `json:"additions"`
 		Deletions    int `json:"deletions"`
@@ -588,11 +588,23 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+vendor/
 
 # Build outputs
 dist/
 build/
 *.egg-info/
+target/
+out/
+
+# Framework build directories
+.next/
+.nuxt/
+.svelte-kit/
+.astro/
+.vercel/
+.netlify/
+.turbo/
 
 # IDE
 .idea/
@@ -607,7 +619,12 @@ Thumbs.db
 # Environment
 .env
 .env.local
+.env*.local
 *.log
+
+# Cache
+.cache/
+.parcel-cache/
 `
 		if err := os.WriteFile(gitignorePath, []byte(defaultIgnore), 0644); err != nil {
 			log.Printf("Warning: failed to write .gitignore: %v", err)
@@ -702,4 +719,3 @@ func (r *Repository) GetCommitsSince(sinceHash string, limit int) ([]CommitInfo,
 
 	return uniqueCommits, nil
 }
-

@@ -55,16 +55,38 @@ type DevServer struct {
 
 // Manager manages dev server processes
 type Manager struct {
-	servers       map[string]*DevServer // folderID -> DevServer
-	mu            sync.RWMutex
-	onStateChange func(folderID string, state ServerState, err error)
+	servers         map[string]*DevServer // folderID -> DevServer
+	mu              sync.RWMutex
+	onStateChange   func(folderID string, state ServerState, err error)
+	activityTracker *ActivityTracker
+	configCache     *PreviewConfigCache
 }
 
 // NewManager creates a new dev server manager
 func NewManager() *Manager {
 	return &Manager{
-		servers: make(map[string]*DevServer),
+		servers:         make(map[string]*DevServer),
+		activityTracker: NewActivityTracker(),
+		configCache:     NewPreviewConfigCache(),
 	}
+}
+
+// RecordFileActivity records a file edit for project auto-selection.
+func (m *Manager) RecordFileActivity(folderID, filePath string) {
+	m.activityTracker.RecordActivity(folderID, filePath)
+}
+
+// SavePreviewConfig saves user's project selection for a folder.
+func (m *Manager) SavePreviewConfig(folderID string, projectPath, devCommand string) {
+	m.configCache.Set(folderID, PreviewConfig{
+		ProjectPath: projectPath,
+		DevCommand:  devCommand,
+	})
+}
+
+// SelectProject discovers and selects the best project for preview.
+func (m *Manager) SelectProject(folderID, folderPath, contextPath string) PreviewSelection {
+	return SelectProjectForPreview(folderPath, folderID, contextPath, m.activityTracker, m.configCache)
 }
 
 // SetStateChangeCallback sets a callback for state changes (useful for notifying mobile)
@@ -255,9 +277,247 @@ func WaitForPortWithContext(ctx context.Context, port int, timeout time.Duration
 
 // StartResult contains the result of starting a dev server
 type StartResult struct {
-	Server       *DevServer
+	Server         *DevServer
 	AlreadyRunning bool
-	Error        error
+	Error          error
+}
+
+// StartDiscoveredProject starts a dev server for a discovered project.
+// This supports any ecosystem, not just Node.js.
+func (m *Manager) StartDiscoveredProject(folderID string, project DiscoveredProject, port int) (*DevServer, error) {
+	m.mu.Lock()
+
+	// Check if already running
+	if existing, ok := m.servers[folderID]; ok {
+		existing.mu.RLock()
+		state := existing.State
+		existing.mu.RUnlock()
+
+		if state == StateRunning || state == StateStarting {
+			m.mu.Unlock()
+			log.Printf("⚠️  Dev server already running/starting for folder %s", folderID)
+			return existing, nil
+		}
+		delete(m.servers, folderID)
+	}
+	m.mu.Unlock()
+
+	// Check if port is already in use
+	if IsPortInUse(port) {
+		log.Printf("✅ Port %d already in use - assuming dev server is running", port)
+		server := &DevServer{
+			FolderID:   folderID,
+			FolderPath: project.Path,
+			Port:       port,
+			State:      StateRunning,
+		}
+		m.mu.Lock()
+		m.servers[folderID] = server
+		m.mu.Unlock()
+		return server, nil
+	}
+
+	if !project.HasDevCmd || project.DevCommand == "" {
+		return nil, fmt.Errorf("project %s has no dev command configured", project.Name)
+	}
+
+	// Check for dependencies based on ecosystem
+	if project.Ecosystem == EcosystemNode {
+		if err := CheckDependencies(project.Path); err != nil {
+			return nil, err
+		}
+	}
+
+	log.Printf("📦 Starting %s project: %s (%s)", project.Ecosystem, project.Name, project.Framework)
+
+	// Parse and execute the dev command
+	cmdParts := parseCommand(project.DevCommand)
+	if len(cmdParts) == 0 {
+		return nil, fmt.Errorf("invalid dev command: %s", project.DevCommand)
+	}
+
+	// Modify command for port injection where applicable
+	cmdParts = injectPort(cmdParts, project.Ecosystem, port)
+
+	log.Printf("🚀 Running: %s", strings.Join(cmdParts, " "))
+
+	// Create context with cancel
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Create command
+	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
+	cmd.Dir = project.Path
+
+	// Set up platform-specific process attributes
+	setPlatformSysProcAttr(cmd)
+
+	// Set environment
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, "CI=true")
+	// Port via environment for projects that support it
+	cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", port))
+
+	// Map framework to project type for compatibility
+	projectType := mapFrameworkToProjectType(project.Framework)
+
+	// Create server struct
+	server := &DevServer{
+		FolderID:      folderID,
+		FolderPath:    project.Path,
+		Port:          port,
+		ProjectType:   projectType,
+		State:         StateStarting,
+		Cmd:           cmd,
+		ctx:           ctx,
+		cancel:        cancel,
+		onStateChange: m.onStateChange,
+	}
+
+	// Capture output
+	cmd.Stdout = &logWriter{prefix: "📤 [dev] ", server: server}
+	cmd.Stderr = &logWriter{prefix: "📤 [dev] ", server: server, isErr: true}
+
+	// Start the process
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to start dev server: %w", err)
+	}
+
+	log.Printf("✅ Dev server process started (PID: %d)", cmd.Process.Pid)
+
+	// Store the server
+	m.mu.Lock()
+	m.servers[folderID] = server
+	m.mu.Unlock()
+
+	// Monitor the process in background
+	go m.monitorProcess(server)
+
+	return server, nil
+}
+
+// parseCommand splits a shell command string into parts, handling quoted strings.
+// Supports both single and double quotes for arguments with spaces.
+// Example: `npm run "my script"` -> ["npm", "run", "my script"]
+func parseCommand(cmd string) []string {
+	var parts []string
+	var current strings.Builder
+	var inQuote rune
+	escaped := false
+
+	for _, r := range cmd {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+
+		if inQuote != 0 {
+			if r == inQuote {
+				inQuote = 0
+			} else {
+				current.WriteRune(r)
+			}
+			continue
+		}
+
+		if r == '"' || r == '\'' {
+			inQuote = r
+			continue
+		}
+
+		if r == ' ' || r == '\t' {
+			if current.Len() > 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+			continue
+		}
+
+		current.WriteRune(r)
+	}
+
+	// Add final part if any
+	if current.Len() > 0 {
+		parts = append(parts, current.String())
+	}
+
+	return parts
+}
+
+// injectPort modifies the command to include the port where possible.
+// Note: We also set the PORT environment variable which most frameworks respect.
+// This function only adds explicit flags for frameworks that don't use PORT env.
+func injectPort(cmdParts []string, ecosystem Ecosystem, port int) []string {
+	portStr := fmt.Sprintf("%d", port)
+
+	switch ecosystem {
+	case EcosystemNode:
+		// Node.js frameworks typically respect PORT env var (set in caller).
+		// Don't inject flags here because different frameworks use different flags:
+		// - Next.js: -p PORT
+		// - Vite: --port PORT
+		// - CRA: uses PORT env only
+		// The PORT env var is the safest approach.
+		return cmdParts
+
+	case EcosystemGo:
+		// Go apps typically need to read PORT from env in their code
+		return cmdParts
+
+	case EcosystemPython:
+		// Flask and Django respect PORT env, uvicorn needs explicit --port
+		for _, part := range cmdParts {
+			if strings.Contains(part, "uvicorn") {
+				// Uvicorn: add --port at the end (it respects flag order)
+				return append(cmdParts, "--port", portStr)
+			}
+		}
+		return cmdParts
+
+	case EcosystemRuby:
+		// Rails server: add -p flag
+		for i, part := range cmdParts {
+			if part == "server" && i > 0 && cmdParts[i-1] == "rails" {
+				return append(cmdParts, "-p", portStr)
+			}
+		}
+		return cmdParts
+
+	case EcosystemElixir:
+		// Phoenix uses PORT env (already set in caller)
+		return cmdParts
+
+	case EcosystemPHP:
+		// Laravel artisan serve: add --port
+		for _, part := range cmdParts {
+			if part == "serve" {
+				return append(cmdParts, "--port="+portStr)
+			}
+		}
+		return cmdParts
+	}
+
+	return cmdParts
+}
+
+// mapFrameworkToProjectType maps framework names to legacy ProjectType.
+func mapFrameworkToProjectType(framework string) ProjectType {
+	switch framework {
+	case "nextjs":
+		return ProjectTypeNextJS
+	case "vite":
+		return ProjectTypeVite
+	case "cra":
+		return ProjectTypeCRA
+	default:
+		return ProjectTypeNode
+	}
 }
 
 // Start starts a dev server for the given folder

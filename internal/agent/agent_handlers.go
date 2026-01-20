@@ -74,6 +74,8 @@ func (a *Agent) handleMessage(msg *ws.Message) {
 		a.handlePreviewStart(msg)
 	case ws.MessageTypePreviewStop:
 		a.handlePreviewStop(msg)
+	case ws.MessageTypeInstallDeps:
+		a.handleInstallDeps(msg)
 
 	// System messages
 	case "error":

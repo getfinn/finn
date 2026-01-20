@@ -49,6 +49,11 @@ const (
 	// Spreadsheet Preview
 	MessageTypeSpreadsheetUpdate MessageType = "spreadsheet_update" // Desktop → Mobile/Web: Spreadsheet file changed
 
+	// Project Discovery
+	MessageTypeProjectPicker     MessageType = "project_picker"     // Desktop → Mobile: Multiple projects detected, user must select
+	MessageTypeInstallRequired   MessageType = "install_required"   // Desktop → Mobile: Dependencies need to be installed
+	MessageTypeInstallDeps       MessageType = "install_deps"       // Mobile → Desktop: User confirmed, run install command
+
 	// maxMessageSize is the maximum message size allowed (512 KB)
 	maxMessageSize = 512 * 1024
 
