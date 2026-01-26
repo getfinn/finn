@@ -871,3 +871,196 @@ func (a *Agent) sendStandaloneCommitResponse(folderID string, success bool, mess
 		log.Printf("📤 Sent standalone_commit_response: success=%v, message=%s", success, message)
 	}
 }
+
+// handleBranchSwitch handles a request to switch git branches.
+func (a *Agent) handleBranchSwitch(msg *ws.Message) {
+	var payload struct {
+		FolderID   string `json:"folder_id"`
+		BranchName string `json:"branch_name"`
+		CreateNew  bool   `json:"create_new,omitempty"`
+	}
+
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Printf("Failed to unmarshal branch_switch payload: %v", err)
+		a.sendBranchSwitchedResponse(payload.FolderID, "", false, "Invalid request")
+		return
+	}
+
+	log.Printf("📥 Received branch_switch request: folder=%s branch=%s create=%v",
+		payload.FolderID, payload.BranchName, payload.CreateNew)
+
+	// Find the folder path
+	var folderPath string
+	for _, folder := range a.cfg.ApprovedFolders {
+		if folder.ID == payload.FolderID {
+			folderPath = folder.Path
+			break
+		}
+	}
+
+	if folderPath == "" {
+		log.Printf("❌ Folder not found: %s", payload.FolderID)
+		a.sendBranchSwitchedResponse(payload.FolderID, payload.BranchName, false, "Folder not found")
+		return
+	}
+
+	if !git.IsGitRepo(folderPath) {
+		log.Printf("❌ Not a git repository: %s", folderPath)
+		a.sendBranchSwitchedResponse(payload.FolderID, payload.BranchName, false, "Not a git repository")
+		return
+	}
+
+	repo := git.NewRepository(folderPath)
+
+	// Get current branch before switching (for the response)
+	previousBranch, _ := repo.GetCurrentBranch()
+
+	// Check for uncommitted changes
+	hasChanges, err := repo.HasChanges()
+	if err != nil {
+		log.Printf("❌ Failed to check for changes: %v", err)
+		a.sendBranchSwitchedResponse(payload.FolderID, payload.BranchName, false,
+			fmt.Sprintf("Failed to check for changes: %v", err))
+		return
+	}
+
+	if hasChanges {
+		log.Printf("⚠️ Uncommitted changes detected - cannot switch branches")
+		a.sendBranchSwitchedResponse(payload.FolderID, payload.BranchName, false,
+			"Cannot switch branches with uncommitted changes. Please commit or discard your changes first.")
+		return
+	}
+
+	// Switch to the branch
+	if err := repo.SwitchBranch(payload.BranchName, payload.CreateNew); err != nil {
+		log.Printf("❌ Failed to switch branch: %v", err)
+		a.sendBranchSwitchedResponse(payload.FolderID, payload.BranchName, false,
+			fmt.Sprintf("Failed to switch branch: %v", err))
+		return
+	}
+
+	log.Printf("✅ Switched to branch: %s", payload.BranchName)
+	a.sendBranchSwitchedResponseFull(payload.FolderID, payload.BranchName, true, "", previousBranch)
+
+	// Send updated folder list with new current branch
+	a.sendFolderListUpdate()
+}
+
+// sendBranchSwitchedResponse sends a branch switch result with standard fields.
+func (a *Agent) sendBranchSwitchedResponse(folderID, branchName string, success bool, errMsg string) {
+	a.sendBranchSwitchedResponseFull(folderID, branchName, success, errMsg, "")
+}
+
+// sendBranchSwitchedResponseFull sends a branch switch result with all fields.
+func (a *Agent) sendBranchSwitchedResponseFull(folderID, branchName string, success bool, errMsg, previousBranch string) {
+	responseData := map[string]any{
+		"folder_id":   folderID,
+		"branch_name": branchName,
+		"success":     success,
+	}
+
+	if errMsg != "" {
+		responseData["error"] = errMsg
+	}
+	if previousBranch != "" {
+		responseData["previous_branch"] = previousBranch
+	}
+
+	payload, _ := json.Marshal(responseData)
+
+	msg := &ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       ws.MessageTypeBranchSwitched,
+		Payload:    payload,
+	}
+
+	if err := a.wsClient.SendMessage(msg); err != nil {
+		log.Printf("❌ Failed to send branch_switched: %v", err)
+	} else {
+		log.Printf("📤 Sent branch_switched: success=%v, branch=%s", success, branchName)
+	}
+}
+
+// handleGetBranches handles a request for the list of git branches.
+func (a *Agent) handleGetBranches(msg *ws.Message) {
+	var payload struct {
+		FolderID string `json:"folder_id"`
+	}
+
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Printf("Failed to unmarshal get_branches payload: %v", err)
+		return
+	}
+
+	log.Printf("📥 Received get_branches request for folder: %s", payload.FolderID)
+
+	// Find the folder path
+	var folderPath string
+	for _, folder := range a.cfg.ApprovedFolders {
+		if folder.ID == payload.FolderID {
+			folderPath = folder.Path
+			break
+		}
+	}
+
+	if folderPath == "" {
+		log.Printf("❌ Folder not found: %s", payload.FolderID)
+		a.sendBranchListError(payload.FolderID, "Folder not found")
+		return
+	}
+
+	if !git.IsGitRepo(folderPath) {
+		log.Printf("❌ Not a git repository: %s", folderPath)
+		a.sendBranchListError(payload.FolderID, "Not a git repository")
+		return
+	}
+
+	repo := git.NewRepository(folderPath)
+
+	branches, err := repo.ListBranches()
+	if err != nil {
+		log.Printf("❌ Failed to list branches: %v", err)
+		a.sendBranchListError(payload.FolderID, fmt.Sprintf("Failed to list branches: %v", err))
+		return
+	}
+
+	currentBranch, _ := repo.GetCurrentBranch()
+
+	responsePayload, _ := json.Marshal(map[string]any{
+		"folder_id":      payload.FolderID,
+		"branches":       branches,
+		"current_branch": currentBranch,
+	})
+
+	responseMsg := &ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       ws.MessageTypeBranchList,
+		Payload:    responsePayload,
+	}
+
+	if err := a.wsClient.SendMessage(responseMsg); err != nil {
+		log.Printf("❌ Failed to send branch_list: %v", err)
+	} else {
+		log.Printf("📤 Sent %d branches for folder %s (current: %s)", len(branches), payload.FolderID, currentBranch)
+	}
+}
+
+// sendBranchListError sends an error response for branch list request.
+func (a *Agent) sendBranchListError(folderID, errMsg string) {
+	payload, _ := json.Marshal(map[string]any{
+		"folder_id": folderID,
+		"error":     errMsg,
+		"branches":  []string{},
+	})
+
+	msg := &ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       ws.MessageTypeBranchList,
+		Payload:    payload,
+	}
+
+	a.wsClient.SendMessage(msg)
+}

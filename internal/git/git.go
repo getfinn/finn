@@ -235,6 +235,65 @@ func (r *Repository) GetCurrentBranch() (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// ListBranches returns a list of all local branch names
+func (r *Repository) ListBranches() ([]string, error) {
+	cmd := exec.Command("git", "branch", "--format=%(refname:short)")
+	cmd.Dir = r.path
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list branches: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	branches := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			branches = append(branches, trimmed)
+		}
+	}
+
+	return branches, nil
+}
+
+// SwitchBranch switches to the specified branch
+// If createIfMissing is true and the branch doesn't exist, it will be created
+func (r *Repository) SwitchBranch(branchName string, createIfMissing bool) error {
+	// Check if branch exists
+	branches, err := r.ListBranches()
+	if err != nil {
+		return fmt.Errorf("failed to list branches: %w", err)
+	}
+
+	branchExists := false
+	for _, b := range branches {
+		if b == branchName {
+			branchExists = true
+			break
+		}
+	}
+
+	var cmd *exec.Cmd
+	if branchExists {
+		cmd = exec.Command("git", "checkout", branchName)
+	} else if createIfMissing {
+		cmd = exec.Command("git", "checkout", "-b", branchName)
+	} else {
+		return fmt.Errorf("branch '%s' does not exist", branchName)
+	}
+
+	cmd.Dir = r.path
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to switch branch: %s", stderr.String())
+	}
+
+	return nil
+}
+
 // HasChanges returns true if there are uncommitted changes
 func (r *Repository) HasChanges() (bool, error) {
 	files, err := r.DetectChangedFiles()

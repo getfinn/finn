@@ -150,7 +150,8 @@ func (a *Agent) startOneShotExecution(conversationID, folderID, folderPath, prom
 	a.conversationStatesMu.Unlock()
 	log.Printf("📊 Created conversation state for one-shot: %s (folder: %s)", conversationID, folderID)
 
-	// Execute and mark completed after finish (don't delete state - TTL handles cleanup)
+	// Execute task - DON'T mark as completed until user approves/rejects
+	// This allows the approval flow to work in one-shot mode
 	go func() {
 		if err := executor.ExecuteTask(prompt); err != nil {
 			log.Printf("❌ Task execution failed: %v", err)
@@ -161,15 +162,9 @@ func (a *Agent) startOneShotExecution(conversationID, folderID, folderPath, prom
 		delete(a.executors, conversationID)
 		a.executorsMu.Unlock()
 
-		// Mark conversation as completed (TTL cleanup will handle deletion)
-		a.conversationStatesMu.Lock()
-		if state, exists := a.conversationStates[conversationID]; exists {
-			state.isCompleted = true
-			now := time.Now()
-			state.completedAt = &now
-			log.Printf("✅ One-shot task completed, state preserved for approvals: %s", conversationID)
-		}
-		a.conversationStatesMu.Unlock()
+		// NOTE: Do NOT mark isCompleted here - wait for user to approve/reject
+		// The handleApproval function will mark it as completed after processing
+		log.Printf("✅ One-shot task execution finished, awaiting user approval: %s", conversationID)
 
 		// Unmark PocketVibe session now that execution is complete
 		a.UnmarkPocketVibeSession(folderPath)
@@ -285,15 +280,9 @@ func (a *Agent) startGeminiOneShotExecution(conversationID, folderID, folderPath
 		delete(a.llmExecutors, conversationID)
 		a.executorsMu.Unlock()
 
-		// Mark conversation as completed (TTL cleanup will handle deletion)
-		a.conversationStatesMu.Lock()
-		if state, exists := a.conversationStates[conversationID]; exists {
-			state.isCompleted = true
-			now := time.Now()
-			state.completedAt = &now
-			log.Printf("✅ [Gemini] One-shot task completed, state preserved for approvals: %s", conversationID)
-		}
-		a.conversationStatesMu.Unlock()
+		// NOTE: Do NOT mark isCompleted here - wait for user to approve/reject
+		// The handleApproval function will mark it as completed after processing
+		log.Printf("✅ [Gemini] One-shot task execution finished, awaiting user approval: %s", conversationID)
 
 		// Unmark PocketVibe session now that execution is complete
 		a.UnmarkPocketVibeSession(folderPath)

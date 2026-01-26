@@ -54,6 +54,12 @@ const (
 	MessageTypeInstallRequired   MessageType = "install_required"   // Desktop → Mobile: Dependencies need to be installed
 	MessageTypeInstallDeps       MessageType = "install_deps"       // Mobile → Desktop: User confirmed, run install command
 
+	// Branch Management
+	MessageTypeBranchSwitch   MessageType = "branch_switch"   // Mobile/Web → Desktop: Request to switch git branch
+	MessageTypeBranchSwitched MessageType = "branch_switched" // Desktop → Mobile/Web: Branch switch completed
+	MessageTypeBranchList     MessageType = "branch_list"     // Desktop → Mobile/Web: List of available branches
+	MessageTypeGetBranches    MessageType = "get_branches"    // Mobile/Web → Desktop: Request branch list
+
 	// maxMessageSize is the maximum message size allowed (512 KB)
 	maxMessageSize = 512 * 1024
 

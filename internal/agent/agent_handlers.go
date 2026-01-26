@@ -61,6 +61,14 @@ func (a *Agent) handleMessage(msg *ws.Message) {
 		log.Println("📝 Mobile requested standalone commit")
 		a.handleStandaloneCommit(msg)
 
+	// Branch management messages
+	case ws.MessageTypeBranchSwitch:
+		log.Println("🌿 Mobile/Web requested branch switch")
+		a.handleBranchSwitch(msg)
+	case ws.MessageTypeGetBranches:
+		log.Println("🌿 Mobile/Web requested branch list")
+		a.handleGetBranches(msg)
+
 	// Session messages
 	case "resume_session":
 		a.handleResumeSession(msg)
