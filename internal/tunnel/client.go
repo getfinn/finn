@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"sync"
@@ -81,6 +82,10 @@ func NewClient(relayURL, token, userID, deviceID, folderID string, localPort int
 	ctx, cancel := context.WithCancel(context.Background())
 	reconnectCtx, reconnectCancel := context.WithCancel(ctx)
 
+	// Create cookie jar to persist session cookies across requests
+	// This enables OAuth flows where the callback sets session cookies
+	jar, _ := cookiejar.New(nil)
+
 	return &Client{
 		relayURL:  relayURL,
 		token:     token,
@@ -90,6 +95,7 @@ func NewClient(relayURL, token, userID, deviceID, folderID string, localPort int
 		localPort: localPort,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
+			Jar:     jar, // Persist cookies between requests for session handling
 			// Don't follow redirects - let the client handle them
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse

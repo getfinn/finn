@@ -71,9 +71,11 @@ type GeminiStats struct {
 
 // Executor implements llm.Executor for Gemini CLI (one-shot mode).
 type Executor struct {
-	projectPath string
-	onEvent     llm.EventHandler
-	model       string
+	projectPath     string
+	git             *git.Repository
+	onEvent         llm.EventHandler
+	model           string
+	filesBeforeExec []string // Track files changed before execution
 }
 
 // NewExecutor creates a new Gemini CLI executor.
@@ -90,6 +92,7 @@ func NewExecutor(cfg llm.Config) (llm.Executor, error) {
 
 	return &Executor{
 		projectPath: cfg.ProjectPath,
+		git:         git.NewRepository(cfg.ProjectPath),
 		onEvent:     cfg.OnEvent,
 		model:       model,
 	}, nil
@@ -98,6 +101,17 @@ func NewExecutor(cfg llm.Config) (llm.Executor, error) {
 // ExecuteTask runs a task with the given prompt using Gemini CLI.
 func (e *Executor) ExecuteTask(prompt string) error {
 	log.Printf("🚀 [Gemini] Executing task: %s", prompt)
+
+	// Capture files changed BEFORE execution (so we can exclude them from diffs)
+	filesBeforeExec, err := e.git.DetectChangedFiles()
+	if err != nil {
+		log.Printf("⚠️  [Gemini] Failed to detect files before execution: %v", err)
+		filesBeforeExec = []string{} // Continue anyway
+	}
+	e.filesBeforeExec = filesBeforeExec
+	if len(filesBeforeExec) > 0 {
+		log.Printf("📋 [Gemini] Detected %d uncommitted files before execution (will be excluded from conversation diffs)", len(filesBeforeExec))
+	}
 
 	// Security instructions (same as Claude)
 	securityInstructions := fmt.Sprintf(`CRITICAL SECURITY RULES:
@@ -216,10 +230,8 @@ func (e *Executor) handleStreamMessage(msg GeminiStreamMessage) {
 				Content: usageJSON,
 			})
 		}
-		e.sendEvent(llm.Event{
-			Type:    llm.EventTypeComplete,
-			Content: json.RawMessage(`{"status":"success"}`),
-		})
+		// Generate diffs and send complete event (like Claude does)
+		e.handleCompletion()
 
 	case "error":
 		errMsg := "unknown error"
@@ -250,6 +262,86 @@ func (e *Executor) sendEvent(event llm.Event) {
 	if e.onEvent != nil {
 		e.onEvent(event)
 	}
+}
+
+// handleCompletion generates diffs for changed files and sends completion event
+func (e *Executor) handleCompletion() {
+	// Get all changed files after execution
+	filesAfterExec, err := e.git.DetectChangedFiles()
+	if err != nil {
+		log.Printf("⚠️  [Gemini] Failed to detect changes: %v", err)
+		e.sendEvent(llm.Event{
+			Type:    llm.EventTypeComplete,
+			Content: json.RawMessage(`{"status":"success","files_changed":0}`),
+		})
+		return
+	}
+
+	// Filter out files that existed before execution
+	filesBeforeMap := make(map[string]bool)
+	for _, file := range e.filesBeforeExec {
+		filesBeforeMap[file] = true
+	}
+
+	var newFiles []string
+	for _, file := range filesAfterExec {
+		if !filesBeforeMap[file] {
+			newFiles = append(newFiles, file)
+		}
+	}
+
+	if len(newFiles) == 0 {
+		log.Println("📊 [Gemini] No new changes made during this conversation")
+		e.sendEvent(llm.Event{
+			Type:    llm.EventTypeComplete,
+			Content: json.RawMessage(`{"files_changed":0}`),
+		})
+		return
+	}
+
+	// Generate diffs only for NEW files
+	log.Printf("📊 [Gemini] Generating diffs for %d files changed in this conversation...", len(newFiles))
+	diffs := make(map[string]string)
+
+	for _, file := range newFiles {
+		diff, err := e.git.GenerateDiff(file)
+		if err != nil {
+			log.Printf("⚠️  [Gemini] Failed to generate diff for %s: %v", file, err)
+			continue
+		}
+		diffs[file] = diff
+	}
+
+	if len(diffs) == 0 {
+		log.Println("⚠️  [Gemini] No valid diffs generated (all empty)")
+		e.sendEvent(llm.Event{
+			Type:    llm.EventTypeComplete,
+			Content: json.RawMessage(`{"files_changed":0}`),
+		})
+		return
+	}
+
+	log.Printf("📊 [Gemini] Generated diffs for %d files", len(diffs))
+
+	// Send diffs to mobile (matching Claude's format)
+	diffData := map[string]interface{}{
+		"diffs":         diffs,
+		"files_changed": len(diffs),
+	}
+	diffJSON, _ := json.Marshal(diffData)
+
+	log.Println("📤 [Gemini] Sending diff to mobile")
+	e.sendEvent(llm.Event{
+		Type:    llm.EventTypeDiff,
+		Content: diffJSON,
+	})
+
+	// Send complete event after diff
+	log.Printf("✅ [Gemini] Sent %d diffs to mobile - task complete", len(diffs))
+	e.sendEvent(llm.Event{
+		Type:    llm.EventTypeComplete,
+		Content: json.RawMessage(fmt.Sprintf(`{"files_changed":%d}`, len(diffs))),
+	})
 }
 
 // Provider returns the provider type.
@@ -491,6 +583,8 @@ func (e *InteractiveExecutor) handleInteractiveStreamMessage(msg GeminiStreamMes
 				Content: usageJSON,
 			})
 		}
+		// Generate and send diffs immediately when result is received (like Claude does)
+		e.handleCompletion()
 
 	case "error":
 		errMsg := "unknown error"
@@ -551,17 +645,35 @@ func (e *InteractiveExecutor) handleCompletion() {
 		diffs[file] = diff
 	}
 
+	// Check if we got any valid diffs (matching Claude's behavior)
+	if len(diffs) == 0 {
+		log.Println("⚠️  [Gemini] No valid diffs generated (all empty)")
+		e.sendEvent(llm.Event{
+			Type:    llm.EventTypeComplete,
+			Content: json.RawMessage(`{"files_changed":0}`),
+		})
+		return
+	}
+
 	log.Printf("📊 [Gemini] Generated diffs for %d files", len(diffs))
 
+	// Send ALL diffs in one batch (matching Claude's format)
 	diffData := map[string]interface{}{
-		"diffs":             diffs,
-		"files_changed":     len(diffs),
-		"requires_approval": true,
+		"files_changed": len(diffs),
+		"diffs":         diffs,
 	}
 	diffJSON, _ := json.Marshal(diffData)
 	e.sendEvent(llm.Event{
 		Type:    llm.EventTypeDiff,
 		Content: diffJSON,
+	})
+
+	log.Printf("✅ [Gemini] Sent %d diffs to mobile - task complete", len(diffs))
+
+	// Send complete event after diff (so mobile knows task is done)
+	e.sendEvent(llm.Event{
+		Type:    llm.EventTypeComplete,
+		Content: json.RawMessage(fmt.Sprintf(`{"message":"%d files changed"}`, len(diffs))),
 	})
 }
 
