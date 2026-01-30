@@ -49,6 +49,9 @@ const (
 	// Spreadsheet Preview
 	MessageTypeSpreadsheetUpdate MessageType = "spreadsheet_update" // Desktop → Mobile/Web: Spreadsheet file changed
 
+	// Static File Preview (HTML/CSS/JS)
+	MessageTypeStaticFileUpdate MessageType = "static_file_update" // Desktop → Mobile/Web: Static file changed, reload preview
+
 	// Project Discovery
 	MessageTypeProjectPicker     MessageType = "project_picker"     // Desktop → Mobile: Multiple projects detected, user must select
 	MessageTypeInstallRequired   MessageType = "install_required"   // Desktop → Mobile: Dependencies need to be installed

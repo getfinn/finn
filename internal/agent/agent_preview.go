@@ -290,6 +290,11 @@ func (a *Agent) handlePreviewStop(msg *ws.Message) {
 		a.spreadsheetWatcher.UnwatchFolder(payload.FolderID)
 	}
 
+	// Stop watching static files for this folder
+	if a.staticWatcher != nil {
+		a.staticWatcher.UnwatchFolder(payload.FolderID)
+	}
+
 	a.tunnelsMu.Lock()
 	if client, ok := a.tunnels[payload.FolderID]; ok {
 		client.Close()
@@ -384,6 +389,11 @@ func (a *Agent) closeAllTunnels() {
 	// Close spreadsheet watcher
 	if a.spreadsheetWatcher != nil {
 		a.spreadsheetWatcher.Close()
+	}
+
+	// Close static file watcher
+	if a.staticWatcher != nil {
+		a.staticWatcher.Close()
 	}
 
 	a.tunnelsMu.Lock()
@@ -690,8 +700,54 @@ func (a *Agent) startFilePreview(folderID, folderPath string, localPort int, tok
 	a.tunnels[folderID] = client
 	a.tunnelsMu.Unlock()
 
+	// Set up file watching for live reload
+	a.setupStaticWatcher(folderID, folderPath)
+
 	// Send preview ready
 	a.sendFilePreviewReady(folderID, localPort)
+}
+
+// setupStaticWatcher sets up file watching for static HTML/CSS/JS files.
+func (a *Agent) setupStaticWatcher(folderID, folderPath string) {
+	a.staticWatcherMu.Lock()
+	defer a.staticWatcherMu.Unlock()
+
+	// Initialize watcher if needed (thread-safe with mutex)
+	if a.staticWatcher == nil {
+		watcher, err := devserver.NewStaticWatcher()
+		if err != nil {
+			log.Printf("⚠️  Failed to create static file watcher: %v", err)
+			return
+		}
+		a.staticWatcher = watcher
+	}
+
+	// Watch the folder
+	err := a.staticWatcher.WatchFolder(folderPath, folderID, func() {
+		// File changed - notify clients to reload
+		a.sendStaticFileUpdate(folderID)
+	})
+	if err != nil {
+		log.Printf("⚠️  Failed to watch static files: %v", err)
+	}
+}
+
+// sendStaticFileUpdate notifies clients that a static file has been updated.
+// The mobile client should reload the WebView when receiving this message.
+func (a *Agent) sendStaticFileUpdate(folderID string) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"folder_id": folderID,
+		"timestamp": time.Now().Unix(),
+	})
+
+	a.wsClient.SendMessage(&ws.Message{
+		UserID:     a.cfg.UserID,
+		DeviceType: "desktop",
+		Type:       ws.MessageTypeStaticFileUpdate,
+		Payload:    payload,
+	})
+
+	log.Printf("📄 Static file update sent: folder=%s", folderID)
 }
 
 // sendFilePreviewReady sends a preview_ready message for file server previews.

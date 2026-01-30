@@ -69,6 +69,10 @@ type Agent struct {
 	spreadsheetWatcher   *devserver.SpreadsheetWatcher
 	spreadsheetWatcherMu sync.Mutex
 
+	// Static file watcher for HTML/CSS/JS live updates
+	staticWatcher   *devserver.StaticWatcher
+	staticWatcherMu sync.Mutex
+
 	// Git sync tracking (folderID -> last known HEAD hash)
 	lastKnownHeads   map[string]string
 	lastKnownHeadsMu sync.RWMutex
