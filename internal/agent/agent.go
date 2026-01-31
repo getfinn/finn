@@ -113,6 +113,14 @@ func New(headless bool, dev bool) (*Agent, error) {
 	}, nil
 }
 
+// sendMessage sends a WebSocket message with error logging.
+// Use this for fire-and-forget messages where we want to log failures but not block.
+func (a *Agent) sendMessage(msg *ws.Message) {
+	if err := a.wsClient.SendMessage(msg); err != nil {
+		log.Printf("⚠️  Failed to send %s message: %v", msg.Type, err)
+	}
+}
+
 // Start starts the agent and all its subsystems.
 func (a *Agent) Start() error {
 	log.Println("🚀 PocketVibe Desktop Daemon starting...")
