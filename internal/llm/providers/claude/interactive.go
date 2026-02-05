@@ -568,6 +568,22 @@ func (e *InteractiveTaskExecutor) handleStreamMessage(msg StreamMessage) error {
 		}
 
 	case "result":
+		// Check if this is an error result (e.g., session not found, execution error)
+		if msg.IsError || msg.Subtype == "error_during_execution" {
+			errorMsg := "Claude execution failed"
+			if len(msg.Errors) > 0 {
+				errorMsg = msg.Errors[0] // Use first error message
+			} else if msg.Result != "" {
+				errorMsg = msg.Result
+			}
+			log.Printf("❌ Claude execution error: %s", errorMsg)
+			e.sendEvent(Event{
+				Type:    EventTypeError,
+				Content: json.RawMessage(fmt.Sprintf(`{"message":"%s"}`, errorMsg)),
+			})
+			return fmt.Errorf("claude execution error: %s", errorMsg)
+		}
+
 		// Task complete - all tools have executed, files are written
 		log.Printf("✅ Claude Code execution complete: %s", msg.Result)
 

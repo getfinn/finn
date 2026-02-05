@@ -42,6 +42,10 @@ type StreamMessage struct {
 	TopLevelUsage *UsageInfo `json:"usage,omitempty"`          // Final aggregated usage (result messages)
 	TotalCostUSD  float64    `json:"total_cost_usd,omitempty"` // Total cost in USD
 	DurationMs    int64      `json:"duration_ms,omitempty"`    // Duration in milliseconds
+
+	// Error fields for "result" messages with subtype "error_during_execution"
+	IsError bool     `json:"is_error,omitempty"` // True if execution failed
+	Errors  []string `json:"errors,omitempty"`   // Error messages from Claude CLI
 }
 
 // MessageHandler is called for each streaming message

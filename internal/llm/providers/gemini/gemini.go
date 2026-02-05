@@ -215,6 +215,23 @@ func (e *Executor) handleStreamMessage(msg GeminiStreamMessage) {
 		}
 
 	case "result":
+		// Check if this is an error result (status != "success")
+		if msg.Status != "" && msg.Status != "success" {
+			errorMsg := "Gemini execution failed"
+			if msg.Error != nil && msg.Error.Message != "" {
+				errorMsg = msg.Error.Message
+			} else if msg.Output != "" {
+				errorMsg = msg.Output
+			}
+			log.Printf("❌ [Gemini] Execution error (status=%s): %s", msg.Status, errorMsg)
+			errorJSON, _ := json.Marshal(map[string]string{"message": errorMsg})
+			e.sendEvent(llm.Event{
+				Type:    llm.EventTypeError,
+				Content: errorJSON,
+			})
+			return // Don't proceed to completion handling
+		}
+
 		log.Printf("✅ [Gemini] Task complete")
 		if msg.Stats != nil {
 			usageJSON, _ := json.Marshal(map[string]interface{}{
@@ -569,6 +586,23 @@ func (e *InteractiveExecutor) handleInteractiveStreamMessage(msg GeminiStreamMes
 		}
 
 	case "result":
+		// Check if this is an error result (status != "success")
+		if msg.Status != "" && msg.Status != "success" {
+			errorMsg := "Gemini execution failed"
+			if msg.Error != nil && msg.Error.Message != "" {
+				errorMsg = msg.Error.Message
+			} else if msg.Output != "" {
+				errorMsg = msg.Output
+			}
+			log.Printf("❌ [Gemini] Execution error (status=%s): %s", msg.Status, errorMsg)
+			errorJSON, _ := json.Marshal(map[string]string{"message": errorMsg})
+			e.sendEvent(llm.Event{
+				Type:    llm.EventTypeError,
+				Content: errorJSON,
+			})
+			return // Don't proceed to completion handling
+		}
+
 		log.Printf("✅ [Gemini] Turn complete")
 		if msg.Stats != nil {
 			usageJSON, _ := json.Marshal(map[string]interface{}{
