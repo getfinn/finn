@@ -357,7 +357,7 @@ func (e *Executor) handleCompletion() {
 	log.Printf("✅ [Gemini] Sent %d diffs to mobile - task complete", len(diffs))
 	e.sendEvent(llm.Event{
 		Type:    llm.EventTypeComplete,
-		Content: json.RawMessage(fmt.Sprintf(`{"files_changed":%d}`, len(diffs))),
+		Content: llm.FilesChangedContent(len(diffs), false),
 	})
 }
 
@@ -707,7 +707,7 @@ func (e *InteractiveExecutor) handleCompletion() {
 	// Send complete event after diff (so mobile knows task is done)
 	e.sendEvent(llm.Event{
 		Type:    llm.EventTypeComplete,
-		Content: json.RawMessage(fmt.Sprintf(`{"message":"%d files changed"}`, len(diffs))),
+		Content: llm.MessageContent(fmt.Sprintf("%d files changed", len(diffs))),
 	})
 }
 

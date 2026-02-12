@@ -64,7 +64,6 @@ func (e *Executor) Execute(prompt string, handler MessageHandler) error {
 User request: `, e.projectPath)
 	fullPrompt := securityInstructions + prompt
 
-	// Build command
 	cmd := exec.Command("claude", "-p",
 		"--output-format", "stream-json",
 		"--verbose", // Required for stream-json output format

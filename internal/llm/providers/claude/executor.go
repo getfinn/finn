@@ -46,6 +46,13 @@ type Event struct {
 // EventHandler is called for each event during execution
 type EventHandler func(Event)
 
+// jsonMessage safely builds a JSON content payload with a message field.
+// Uses json.Marshal to prevent JSON injection from unescaped strings.
+func jsonMessage(message string) json.RawMessage {
+	data, _ := json.Marshal(map[string]string{"message": message})
+	return data
+}
+
 // NewTaskExecutor creates a new task executor
 func NewTaskExecutor(projectPath string, requiresApproval bool, onEvent EventHandler) *TaskExecutor {
 	return &TaskExecutor{
@@ -137,7 +144,7 @@ func (e *TaskExecutor) ExecuteTask(prompt string) error {
 				log.Printf("❌ Claude execution error: %s", errorMsg)
 				e.sendEvent(Event{
 					Type:    EventTypeError,
-					Content: json.RawMessage(fmt.Sprintf(`{"message":"%s"}`, errorMsg)),
+					Content: jsonMessage(errorMsg),
 				})
 				return fmt.Errorf("claude execution error: %s", errorMsg)
 			}
@@ -153,7 +160,7 @@ func (e *TaskExecutor) ExecuteTask(prompt string) error {
 	if err != nil {
 		e.sendEvent(Event{
 			Type:    EventTypeError,
-			Content: json.RawMessage(fmt.Sprintf(`{"message":"%s"}`, err.Error())),
+			Content: jsonMessage(err.Error()),
 		})
 		return err
 	}
@@ -240,7 +247,7 @@ func (e *TaskExecutor) handleCompletion() error {
 		log.Println("✅ Task complete - auto-approved mode")
 		e.sendEvent(Event{
 			Type:    EventTypeComplete,
-			Content: json.RawMessage(fmt.Sprintf(`{"files_changed":%d,"auto_approved":true}`, len(diffs))),
+			Content: func() json.RawMessage { b, _ := json.Marshal(map[string]interface{}{"files_changed": len(diffs), "auto_approved": true}); return b }(),
 		})
 	}
 	// If manual approval mode, we wait for user to approve before completing

@@ -139,7 +139,7 @@ func (m *Manager) StartFileServer(folderID, folderPath string, port int) (*FileS
 
 	// Create HTTP server
 	fs.server = &http.Server{
-		Addr:         fmt.Sprintf(":%d", port),
+		Addr:         fmt.Sprintf("127.0.0.1:%d", port),
 		Handler:      fileHandler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,

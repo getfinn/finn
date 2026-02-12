@@ -101,6 +101,25 @@ type Config struct {
 	ExtraConfig map[string]string // Provider-specific configuration
 }
 
+// ErrorContent safely builds a JSON content payload for error events.
+// Uses json.Marshal instead of fmt.Sprintf to prevent JSON injection.
+func ErrorContent(message string) json.RawMessage {
+	data, _ := json.Marshal(map[string]string{"message": message})
+	return json.RawMessage(data)
+}
+
+// MessageContent safely builds a JSON content payload with a message field.
+func MessageContent(message string) json.RawMessage {
+	data, _ := json.Marshal(map[string]string{"message": message})
+	return json.RawMessage(data)
+}
+
+// FilesChangedContent safely builds a JSON content payload for completion events.
+func FilesChangedContent(count int, autoApproved bool) json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{"files_changed": count, "auto_approved": autoApproved})
+	return json.RawMessage(data)
+}
+
 // Factory creates executors based on configuration.
 // This is the main entry point for creating LLM executors.
 type Factory interface {

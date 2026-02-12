@@ -91,7 +91,7 @@ func NewWatcher(callbacks SessionCallbacks) (*Watcher, error) {
 	claudePath := filepath.Join(home, ".claude", "projects")
 
 	// Create directory if it doesn't exist
-	os.MkdirAll(claudePath, 0755)
+	os.MkdirAll(claudePath, 0700)
 
 	w := &Watcher{
 		claudePath:     claudePath,

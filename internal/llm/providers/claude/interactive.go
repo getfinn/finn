@@ -342,7 +342,7 @@ func (e *InteractiveTaskExecutor) streamOutput(stdout io.Reader) {
 			log.Printf("❌ Error handling stream message: %v", err)
 			e.sendEvent(Event{
 				Type:    EventTypeError,
-				Content: json.RawMessage(fmt.Sprintf(`{"message":"%s"}`, err.Error())),
+				Content: jsonMessage(err.Error()),
 			})
 		}
 	}
@@ -579,7 +579,7 @@ func (e *InteractiveTaskExecutor) handleStreamMessage(msg StreamMessage) error {
 			log.Printf("❌ Claude execution error: %s", errorMsg)
 			e.sendEvent(Event{
 				Type:    EventTypeError,
-				Content: json.RawMessage(fmt.Sprintf(`{"message":"%s"}`, errorMsg)),
+				Content: jsonMessage(errorMsg),
 			})
 			return fmt.Errorf("claude execution error: %s", errorMsg)
 		}
@@ -634,7 +634,7 @@ func (e *InteractiveTaskExecutor) handleCompletion() error {
 	if err != nil {
 		e.sendEvent(Event{
 			Type:    EventTypeError,
-			Content: json.RawMessage(fmt.Sprintf(`{"message":"Failed to detect changes: %s"}`, err.Error())),
+			Content: jsonMessage("Failed to detect changes: " + err.Error()),
 		})
 		return fmt.Errorf("failed to detect changes: %w", err)
 	}
@@ -744,7 +744,7 @@ func (e *InteractiveTaskExecutor) sendCompleteEvent(message string) {
 	e.turnCompleted = true
 	e.sendEvent(Event{
 		Type:    EventTypeComplete,
-		Content: json.RawMessage(fmt.Sprintf(`{"message":"%s"}`, message)),
+		Content: jsonMessage(message),
 	})
 	log.Println("✅ Sent complete event")
 }
@@ -759,7 +759,7 @@ func (e *InteractiveTaskExecutor) ContinueAfterApproval() error {
 		log.Printf("❌ Failed to commit changes: %v", err)
 		e.sendEvent(Event{
 			Type:    EventTypeError,
-			Content: json.RawMessage(fmt.Sprintf(`{"message":"Failed to commit: %s"}`, err.Error())),
+			Content: jsonMessage("Failed to commit: " + err.Error()),
 		})
 		return fmt.Errorf("failed to commit changes: %w", err)
 	}

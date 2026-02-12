@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/getfinn/finn/internal/git"
 	ws "github.com/getfinn/finn/internal/websocket"
@@ -250,7 +251,7 @@ func (a *Agent) handleBrowseFolders(msg *ws.Message) {
 	}
 
 	absHomeDir, _ := filepath.Abs(homeDir)
-	if !filepath.HasPrefix(absPath, absHomeDir) {
+	if absPath != absHomeDir && !strings.HasPrefix(absPath+string(filepath.Separator), absHomeDir+string(filepath.Separator)) {
 		log.Printf("⚠️ Attempted to browse outside home directory: %s", absPath)
 		a.sendBrowseResponse("", nil, "Access denied: can only browse within your home directory")
 		return

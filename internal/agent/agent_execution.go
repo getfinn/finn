@@ -30,6 +30,14 @@ func (a *Agent) handlePrompt(msg *ws.Message) {
 		return
 	}
 
+	// Reject excessively large prompts to prevent memory exhaustion
+	const maxPromptLen = 100_000 // 100KB
+	if len(payload.Text) > maxPromptLen {
+		log.Printf("❌ Prompt too large: %d bytes (max %d)", len(payload.Text), maxPromptLen)
+		a.sendError(payload.ConversationID, "Prompt too large")
+		return
+	}
+
 	// Use provider from message if specified, otherwise fall back to config default
 	llmProvider := payload.LLMProvider
 	if llmProvider == "" {
