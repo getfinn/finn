@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -12,6 +13,9 @@ import (
 
 	"nhooyr.io/websocket"
 )
+
+// ErrAuthFailure is returned when the relay rejects the token (401)
+var ErrAuthFailure = errors.New("relay rejected token (401 Unauthorized)")
 
 // MessageType represents different message types
 type MessageType string
@@ -87,6 +91,9 @@ type Message struct {
 // MessageHandler is called when a message is received
 type MessageHandler func(msg *Message)
 
+// AuthFailureHandler is called when the relay rejects the token (401)
+type AuthFailureHandler func()
+
 // Client manages the WebSocket connection to the relay server
 type Client struct {
 	url            string
@@ -98,6 +105,7 @@ type Client struct {
 	reconnectDelay time.Duration
 	maxReconnect   time.Duration
 	onMessage      MessageHandler
+	onAuthFailure  AuthFailureHandler
 
 	// Main context (cancelled when Close() is called)
 	ctx    context.Context
@@ -129,6 +137,11 @@ func NewClient(url, token, userID, deviceID string, onMessage MessageHandler) *C
 		ctx:            ctx,
 		cancel:         cancel,
 	}
+}
+
+// SetAuthFailureHandler sets a callback for when authentication fails (401)
+func (c *Client) SetAuthFailureHandler(handler AuthFailureHandler) {
+	c.onAuthFailure = handler
 }
 
 // Connect establishes a WebSocket connection
@@ -187,10 +200,14 @@ func (c *Client) connectLocked() error {
 	urlWithParams := fmt.Sprintf("%s?token=%s&device_type=desktop&device_id=%s", c.url, c.token, c.deviceID)
 
 	// Dial with compression matching relay server
-	conn, _, err := websocket.Dial(c.ctx, urlWithParams, &websocket.DialOptions{
+	conn, resp, err := websocket.Dial(c.ctx, urlWithParams, &websocket.DialOptions{
 		CompressionMode: websocket.CompressionContextTakeover,
 	})
 	if err != nil {
+		// Detect auth rejection (401) - token is invalid/expired
+		if resp != nil && resp.StatusCode == 401 {
+			return ErrAuthFailure
+		}
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
@@ -230,6 +247,16 @@ func (c *Client) ConnectWithRetry() {
 		err := c.connectLocked()
 		if err == nil {
 			return // Successfully connected
+		}
+
+		// Stop retrying on auth failure - token is invalid
+		if errors.Is(err, ErrAuthFailure) {
+			log.Println("🔐 Authentication failed - your token is invalid or expired.")
+			log.Println("🔐 Please sign out and sign back in, or run: finn --reset-auth")
+			if c.onAuthFailure != nil {
+				c.onAuthFailure()
+			}
+			return
 		}
 
 		log.Printf("Failed to connect: %v. Retrying in %v...", err, delay)
@@ -389,6 +416,16 @@ func (c *Client) reconnectLoop() {
 			// Success log only on reconnect (not initial connect)
 			if attempt > 1 {
 				log.Printf("✅ Reconnected after %d attempt(s)", attempt)
+			}
+			return
+		}
+
+		// Stop retrying on auth failure - token is invalid
+		if errors.Is(err, ErrAuthFailure) {
+			log.Println("🔐 Authentication failed - your token is invalid or expired.")
+			log.Println("🔐 Please sign out and sign back in, or run: finn --reset-auth")
+			if c.onAuthFailure != nil {
+				c.onAuthFailure()
 			}
 			return
 		}
